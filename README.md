@@ -25,6 +25,7 @@ Inspired by [Andrej Karpathy's nanoGPT](https://github.com/karpathy/nanoGPT).
 - [Training on the Cloud](#training-on-the-cloud)
 - [Resuming Training](#resuming-training)
 - [Troubleshooting](#troubleshooting)
+- [Stage 2: Make It Conversational](#stage-2-make-it-conversational)
 - [Experiments to Try](#experiments-to-try)
 - [Learning Resources](#learning-resources)
 - [License](#license)
@@ -99,12 +100,15 @@ python generate.py --prompt "Հայաստան"
 armgpt/
 ├── config.py                  # All settings in one place (presets, hyperparameters)
 ├── model.py                   # The GPT model - the brain of ArmGPT (~150 lines)
-├── train.py                   # Training loop - how the model learns (~150 lines)
+├── train.py                   # Stage 1: Training loop (~150 lines)
 ├── generate.py                # Generate text with a trained model (~50 lines)
+├── finetune.py                # Stage 2: Fine-tune on conversations
+├── chat.py                    # Stage 2: Interactive chat interface
 ├── requirements.txt           # Python packages needed
 ├── data/
 │   ├── download.py            # Downloads Armenian Wikipedia text
-│   └── prepare.py             # Cleans text, builds vocab, creates train/val splits
+│   ├── prepare.py             # Cleans text, builds vocab, creates train/val splits
+│   └── prepare_chat.py        # Stage 2: Downloads and prepares conversation data
 ├── tokenizers/
 │   ├── char_tokenizer.py      # Level 1: one character = one token (beginners)
 │   └── bpe_tokenizer.py       # Level 2: subword tokens with BPE (advanced)
@@ -648,6 +652,77 @@ The Wikipedia dump is ~500 MB. If your connection is slow:
 - Use a lower temperature: `--temperature 0.5`
 - Use top-k sampling: `--top_k 20`
 - Make sure you trained on enough data
+
+---
+
+## Stage 2: Make It Conversational
+
+Stage 1 gives you a base model that continues text like autocomplete. Stage 2 fine-tunes it on question-answer pairs so it can have conversations — like a mini ChatGPT in Armenian.
+
+**This is how real AI assistants are built:**
+1. Stage 1: Train on lots of text (Wikipedia) -> model learns language patterns
+2. Stage 2: Fine-tune on conversations (this step) -> model learns to answer questions
+
+### Quick Start (Stage 2)
+
+```bash
+# 1. Install the datasets library (needed to download conversation data)
+pip install datasets
+
+# 2. Download and prepare conversation data (52K Armenian Q&A pairs)
+python data/prepare_chat.py
+
+# 3. Fine-tune your Stage 1 model on conversations
+python finetune.py
+
+# 4. Chat with your model!
+python chat.py
+```
+
+### What Happens in Each Step
+
+**`data/prepare_chat.py`** downloads [Alpaca-Armenian](https://huggingface.co/datasets/saillab/alpaca-armenian-cleaned) — 52,000 instruction/response pairs already translated to Armenian. It formats them with special tokens:
+
+```
+<|user|>Ի՞delays է Արarat:<|end|><|assistant|>Արdelays...<|end|>
+```
+
+**`finetune.py`** loads your Stage 1 model (`checkpoints/final.pt`), extends its vocabulary with the special tokens, and trains it on the conversation data. Uses a lower learning rate and fewer steps since the model already knows Armenian from Stage 1.
+
+**`chat.py`** is an interactive chat loop. Type a question, get a response:
+
+```
+$ python chat.py
+
+==================================================
+  ArmGPT Chat
+  Device: cuda | Temp: 0.7
+  Type 'quit' to exit
+==================================================
+
+You: Ի՞delays է Հdelays
+ArmGPT: Հdelays...
+
+You: quit
+Bye!
+```
+
+### Chat Options
+
+```bash
+python chat.py --temperature 0.3    # more focused responses
+python chat.py --temperature 1.0    # more creative responses
+python chat.py --max_length 500     # longer responses
+python chat.py --checkpoint checkpoints/chat_final.pt  # specific checkpoint
+```
+
+### New Files (Stage 2)
+
+| File | Purpose |
+|---|---|
+| `data/prepare_chat.py` | Download Alpaca-Armenian, format with chat tokens, save as binary |
+| `finetune.py` | Fine-tune Stage 1 model on conversation data |
+| `chat.py` | Interactive CLI chat interface |
 
 ---
 

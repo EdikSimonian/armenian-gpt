@@ -195,7 +195,8 @@ class GPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
+    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None,
+                 stop_tokens=None):
         """
         Generate new tokens one at a time.
 
@@ -204,6 +205,7 @@ class GPT(nn.Module):
             max_new_tokens: how many new tokens to generate
             temperature: controls randomness (0.1 = safe, 1.0 = creative, 2.0 = wild)
             top_k: only sample from the top k most likely tokens (None = all)
+            stop_tokens: set of token IDs that end generation early (e.g. end-of-turn)
 
         Returns:
             idx: the full sequence including generated tokens
@@ -229,5 +231,9 @@ class GPT(nn.Module):
 
             # Append the new token to the sequence
             idx = torch.cat((idx, idx_next), dim=1)
+
+            # Stop early if we hit a stop token (e.g. end-of-turn in chat mode)
+            if stop_tokens and idx_next.item() in stop_tokens:
+                break
 
         return idx
