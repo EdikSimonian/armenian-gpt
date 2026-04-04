@@ -63,24 +63,31 @@ You need Python 3.8 or newer. Open a terminal and run:
 ```bash
 # 1. Get the code
 git clone https://github.com/EdikSimonian/armenian-gpt.git
-cd armgpt
+cd armenian-gpt
 
-# 2. Install dependencies
+# 2. Create a virtual environment (recommended)
+python3 -m venv venv
+source venv/bin/activate        # On Mac/Linux
+# venv\Scripts\activate         # On Windows
+
+# 3. Install dependencies
 pip install -r requirements.txt
 
-# 3. Download Armenian Wikipedia (~500 MB, takes a few minutes)
+# 4. Download Armenian Wikipedia (~500 MB, takes a few minutes)
 python data/download.py
 
-# 4. Prepare the data (clean text, build vocabulary)
+# 5. Prepare the data (clean text, build vocabulary)
 python data/prepare.py
 
-# 5. Train the model (pick one)
+# 6. Train the model (pick one)
 python train.py --preset tiny     # ~1 min on CPU  (for testing)
 python train.py --preset small    # ~30 min on GPU (recommended)
 
-# 6. Generate Armenian text!
+# 7. Generate Armenian text!
 python generate.py --prompt "Հայաստան"
 ```
+
+> **What is a virtual environment?** It's an isolated folder where Python installs packages just for this project, so it doesn't affect your system Python. You need to activate it every time you open a new terminal with `source venv/bin/activate` (Mac/Linux) or `venv\Scripts\activate` (Windows). You'll see `(venv)` in your prompt when it's active.
 
 ### What You Need
 
@@ -589,10 +596,29 @@ Each checkpoint file contains:
 
 ## Troubleshooting
 
+### "externally-managed-environment" error (macOS/Linux)
+
+Modern Python installations don't let you install packages system-wide. Use a virtual environment:
+
+```bash
+# Create it (one time)
+python3 -m venv venv
+
+# Activate it (every time you open a new terminal)
+source venv/bin/activate        # Mac/Linux
+# venv\Scripts\activate         # Windows
+
+# Now pip works
+pip install -r requirements.txt
+```
+
+You'll see `(venv)` in your terminal prompt when the environment is active. If you get "command not found" errors, you probably forgot to activate it.
+
 ### "No module named 'torch'"
 
-Install PyTorch:
+Make sure your virtual environment is activated, then install:
 ```bash
+source venv/bin/activate
 pip install torch
 ```
 
