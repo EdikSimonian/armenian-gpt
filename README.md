@@ -51,7 +51,7 @@ This entire project is ~400 lines of Python. Every part is commented so you can 
 
 Click this badge to open a notebook in Google Colab with a free GPU. No installation needed:
 
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/YOUR_USERNAME/armgpt/blob/main/notebooks/armgpt_colab.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/EdikSimonian/armenian-gpt/blob/main/notebooks/armgpt_colab.ipynb)
 
 Just run each cell from top to bottom. The notebook handles everything.
 
@@ -61,7 +61,7 @@ You need Python 3.8 or newer. Open a terminal and run:
 
 ```bash
 # 1. Get the code
-git clone https://github.com/YOUR_USERNAME/armgpt.git
+git clone https://github.com/EdikSimonian/armenian-gpt.git
 cd armgpt
 
 # 2. Install dependencies
@@ -542,7 +542,7 @@ The scripts work on any machine with Python and PyTorch:
 
 ```bash
 # SSH into your cloud machine, then:
-git clone https://github.com/YOUR_USERNAME/armgpt.git
+git clone https://github.com/EdikSimonian/armenian-gpt.git
 cd armgpt
 pip install -r requirements.txt
 python data/download.py
