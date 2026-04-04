@@ -1,0 +1,113 @@
+"""
+ArmGPT Text Generation
+
+Generate Armenian text using a trained model.
+
+Usage:
+    python generate.py
+    python generate.py --prompt "Հայաստանի"
+    python generate.py --temperature 0.5 --length 500
+    python generate.py --checkpoint checkpoints/step_5000.pt
+"""
+
+import argparse
+import json
+import os
+import torch
+
+from model import GPT
+
+
+def load_tokenizer(data_dir):
+    """Load the tokenizer used during training."""
+    tok_path = os.path.join(data_dir, "tokenizer.json")
+    with open(tok_path, "r", encoding="utf-8") as f:
+        tok_data = json.load(f)
+
+    if tok_data["type"] == "char":
+        from tokenizers.char_tokenizer import CharTokenizer
+        return CharTokenizer.load(tok_path)
+    else:
+        from tokenizers.bpe_tokenizer import BPETokenizer
+        return BPETokenizer.load(tok_path)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate Armenian text with ArmGPT")
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/final.pt",
+                        help="Path to model checkpoint")
+    parser.add_argument("--prompt", type=str, default="Հայաստան",
+                        help="Starting text (Armenian)")
+    parser.add_argument("--length", type=int, default=300,
+                        help="Number of tokens/characters to generate")
+    parser.add_argument("--temperature", type=float, default=0.8,
+                        help="Randomness: 0.1=safe, 0.8=balanced, 1.5=creative")
+    parser.add_argument("--top_k", type=int, default=40,
+                        help="Only sample from top k tokens (0=all)")
+    parser.add_argument("--num_samples", type=int, default=1,
+                        help="How many samples to generate")
+    parser.add_argument("--data_dir", type=str, default="data",
+                        help="Directory with tokenizer.json")
+    args = parser.parse_args()
+
+    # Load checkpoint
+    if not os.path.exists(args.checkpoint):
+        print(f"Error: checkpoint not found at {args.checkpoint}")
+        print("Train a model first with: python train.py")
+        return
+
+    print(f"Loading model from {args.checkpoint}...")
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    cfg = checkpoint["config"]
+
+    # Determine device
+    if torch.cuda.is_available():
+        device = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = "mps"
+    else:
+        device = "cpu"
+
+    # Load tokenizer
+    tokenizer = load_tokenizer(args.data_dir)
+
+    # Create model and load weights
+    model = GPT(
+        vocab_size=tokenizer.vocab_size,
+        n_layer=cfg["n_layer"],
+        n_head=cfg["n_head"],
+        n_embd=cfg["n_embd"],
+        block_size=cfg["block_size"],
+        dropout=0.0,  # no dropout during generation
+    ).to(device)
+    model.load_state_dict(checkpoint["model"])
+    model.eval()
+
+    # Encode the prompt
+    prompt_ids = tokenizer.encode(args.prompt)
+    if len(prompt_ids) == 0:
+        print("Warning: prompt produced no tokens. Using default seed.")
+        prompt_ids = [0]
+
+    print(f"\nDevice: {device}")
+    print(f"Prompt: {args.prompt}")
+    print(f"Temperature: {args.temperature}")
+    print(f"Generating {args.length} tokens...\n")
+
+    # Generate
+    top_k = args.top_k if args.top_k > 0 else None
+    for i in range(args.num_samples):
+        context = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+        output = model.generate(context, max_new_tokens=args.length,
+                                temperature=args.temperature, top_k=top_k)
+        text = tokenizer.decode(output[0].tolist())
+
+        if args.num_samples > 1:
+            print(f"--- Sample {i+1} ---")
+        print(text)
+        if args.num_samples > 1:
+            print()
+
+
+if __name__ == "__main__":
+    main()
