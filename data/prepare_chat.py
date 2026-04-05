@@ -1,10 +1,13 @@
 """
 Stage 2: Prepare Conversational Data for Fine-tuning
 
-Downloads the Alpaca-Armenian dataset (52K instruction/response pairs in Armenian)
-and formats it with special chat tokens for fine-tuning.
+Formats Q&A data with special chat tokens for fine-tuning.
 
 Usage:
+    # Use hand-crafted Armenian Q&A (recommended):
+    python data/prepare_chat.py --source data/armenian_qa.json
+
+    # Use Alpaca-Armenian from HuggingFace (lower quality):
     python data/prepare_chat.py
 
 After running, you'll have:
@@ -16,6 +19,7 @@ After running, you'll have:
 import os
 import sys
 import json
+import argparse
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -89,17 +93,37 @@ def format_chat(example):
     return f"{USER_TOKEN}{user_msg}{END_TOKEN}{ASSISTANT_TOKEN}{output}{END_TOKEN}"
 
 
+def load_local_json(path: str) -> list:
+    """Load pre-generated Q&A pairs from a local JSON file."""
+    print(f"Loading Q&A from {path}...")
+    with open(path, "r", encoding="utf-8") as f:
+        examples = json.load(f)
+    print(f"  Loaded {len(examples):,} examples")
+    return examples
+
+
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", type=str, default=None,
+                        help="Path to pre-generated JSON file (e.g. data/armenian_qa.json). "
+                             "If omitted, downloads Alpaca-Armenian from HuggingFace.")
+    args = parser.parse_args()
+
     # Step 1: Create output directory
     os.makedirs(CHAT_DIR, exist_ok=True)
 
-    # Step 2: Download dataset
-    ds = download_alpaca_armenian()
+    # Step 2: Load dataset (local file or HuggingFace)
+    if args.source:
+        source_path = args.source
+        if not os.path.isabs(source_path):
+            source_path = os.path.join(os.path.dirname(DATA_DIR), source_path)
+        all_examples = load_local_json(source_path)
+    else:
+        ds = download_alpaca_armenian()
+        all_examples = list(ds["train"]) + list(ds["test"])
+        print(f"\nTotal examples: {len(all_examples):,}")
 
-    # Step 3: Combine train + test, then filter
-    all_examples = list(ds["train"]) + list(ds["test"])
-    print(f"\nTotal examples: {len(all_examples):,}")
-
+    # Step 3: Filter
     print("Filtering inappropriate content...")
     filtered = [ex for ex in all_examples if is_appropriate(ex)]
     print(f"  After filtering: {len(filtered):,} examples "
@@ -189,6 +213,8 @@ def main():
     print(f"  {sample_text[:150]}...")
     print(f"\nRound-trip test: {'PASS' if sample_text == decoded else 'FAIL'}")
 
+    source_label = args.source if args.source else "HuggingFace (Alpaca-Armenian)"
+    print(f"  Source:       {source_label}")
     print(f"\nNext step: python finetune.py")
 
 
