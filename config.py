@@ -41,6 +41,16 @@ PRESETS = {
         learning_rate=6e-4,
         eval_interval=500,
     ),
+    "large": dict(
+        n_layer=12,
+        n_head=12,
+        n_embd=768,
+        block_size=512,
+        batch_size=64,
+        max_iters=20000,
+        learning_rate=3e-4,
+        eval_interval=1000,
+    ),
     # Stage 2: fine-tuning on conversational data
     "finetune": dict(
         n_layer=6,
@@ -97,7 +107,7 @@ def get_config():
     """Parse command-line arguments and return the final config as a dict."""
     parser = argparse.ArgumentParser(description="ArmGPT Training Config")
     parser.add_argument("--preset", type=str, default=None,
-                        choices=["tiny", "small", "medium", "finetune"],
+                        choices=["tiny", "small", "medium", "large", "finetune"],
                         help="Use a preset configuration")
     # Allow overriding any config value from the command line
     parser.add_argument("--n_layer", type=int, default=None)
