@@ -81,8 +81,11 @@ def clean_file_chunked(input_path, output_path, chunk_bytes=50_000_000):
             # Find last newline to avoid splitting mid-line
             last_nl = buffer.rfind("\n")
             if last_nl == -1:
-                # No newline in buffer — keep accumulating
-                continue
+                if len(buffer) > 3 * chunk_bytes:
+                    # Hard cap: force flush to prevent OOM on pathological input
+                    last_nl = len(buffer) - 1
+                else:
+                    continue
 
             # Clean everything up to the last newline
             to_clean = buffer[:last_nl + 1]
@@ -134,7 +137,9 @@ def encode_char_chunked(clean_path, tokenizer, output_path, chunk_bytes=50_000_0
             if not chunk:
                 break
             codepoints = np.array([ord(ch) for ch in chunk], dtype=np.int32)
-            token_ids = lookup[codepoints]
+            # Filter out characters with ordinals beyond our lookup table
+            valid = codepoints[codepoints < max_cp]
+            token_ids = lookup[valid]
             token_ids = token_ids[token_ids >= 0].astype(np.uint16)
             token_ids.tofile(fout)
             total_tokens += len(token_ids)
@@ -165,14 +170,21 @@ def encode_bpe_chunked(clean_path, tokenizer, output_path, chunk_bytes=10_000_00
 
             # Split on paragraph boundary to avoid cutting mid-word
             last_para = buffer.rfind("\n\n")
-            if last_para == -1:
+            if last_para != -1:
+                # Split after the full \n\n
+                split_at = last_para + 2
+            else:
                 last_nl = buffer.rfind("\n")
-                if last_nl == -1:
+                if last_nl != -1:
+                    split_at = last_nl + 1
+                elif len(buffer) > 3 * chunk_bytes:
+                    # Hard cap: force flush to prevent OOM on pathological input
+                    split_at = len(buffer)
+                else:
                     continue
-                last_para = last_nl
 
-            to_encode = buffer[:last_para + 1]
-            buffer = buffer[last_para + 1:]
+            to_encode = buffer[:split_at]
+            buffer = buffer[split_at:]
 
             ids = tokenizer.encode(to_encode)
             np.array(ids, dtype=np.uint16).tofile(fout)

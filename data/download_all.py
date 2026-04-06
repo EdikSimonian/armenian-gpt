@@ -344,12 +344,15 @@ def main():
                     print(f"  [{name}] ERROR: {e}")
                     print(f"  [{name}] Will be skipped in merge.")
 
-        # Add HF files in consistent order
+        # Add HF files in consistent order (only if marker exists = completed)
         for name in ["culturax", "oscar", "mc4", "hplt", "glot500"]:
             if name in hf_file_map:
                 f = hf_file_map[name]
-                if os.path.exists(f):
+                marker = os.path.join(DATA_DIR, f".{name}_done")
+                if os.path.exists(f) and os.path.exists(marker):
                     source_files.append(f)
+                elif os.path.exists(f):
+                    print(f"  [{name}] Incomplete download (no marker), skipping.")
 
     for name in hf_sources:
         if name in skip:

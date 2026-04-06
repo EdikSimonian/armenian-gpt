@@ -68,7 +68,12 @@ def convert_checkpoint(checkpoint_path, tokenizer_path, output_dir):
 
     with open(tokenizer_path, "r", encoding="utf-8") as f:
         tok_data = json.load(f)
-    config_to_save["vocab_size"] = tok_data.get("vocab_size")
+    if tok_data.get("vocab_size"):
+        config_to_save["vocab_size"] = tok_data["vocab_size"]
+    elif tok_data.get("itos"):
+        config_to_save["vocab_size"] = len(tok_data["itos"])
+    else:
+        config_to_save["vocab_size"] = 0
 
     config_path = os.path.join(output_dir, "config.json")
     with open(config_path, "w", encoding="utf-8") as f:

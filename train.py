@@ -183,6 +183,7 @@ def main():
     t0 = time.time()
     train_start = time.time()
     running_loss = 0.0
+    tps = 0
 
     for step in range(start_iter, cfg["max_iters"]):
         # Update learning rate
