@@ -22,22 +22,22 @@ Trains on Armenian text data, then fine-tunes on Q&A for chat.
 
 ### Stage 1: Pretraining data
 
-Run in order — each script downloads and merges into `data/raw_text.txt`:
+Single command downloads all sources, merges into raw_text.txt, and cleans up caches.
+Uses HuggingFace streaming mode — never loads full datasets into RAM.
 
 ```bash
-python data/download.py            # Armenian Wikipedia (~1.5 GB)
-python data/download_cc100.py      # CC-100 (~4.9 GB)
-python data/download_culturax.py   # CulturaX (~5-8 GB)
-python data/download_oscar.py      # OSCAR (~5-8 GB)
-python data/download_mc4.py        # mC4 (~5-15 GB)
-python data/download_hplt.py       # HPLT (~2-5 GB)
-python data/download_glot500.py    # Glot500 (~0.2-0.5 GB)
+python data/download_all.py
 ```
 
-Then tokenize:
+Sources (downloaded in order): Wikipedia, CC-100, CulturaX, OSCAR, mC4, HPLT, Glot500.
+Skip sources with: `python data/download_all.py --skip wiki cc100`
+
+Then tokenize (memory-safe, processes in chunks):
 ```bash
 python data/prepare.py --tokenizer bpe
 ```
+
+Individual download scripts also exist: `data/download_*.py`
 
 ### Stage 2: Chat fine-tuning data
 
@@ -56,9 +56,28 @@ python data/prepare_chat.py --source data/armenian_qa.json # Tokenize for fine-t
 | large | ~85M | 12 | 768 | 512 | 20K | RTX 4090 |
 | xlarge | ~350M | 24 | 1024 | 1024 | 100K | A40 / H100 |
 
-## RunPod A40 Setup
+## RunPod Setup (Secure Cloud — REQUIRED for persistent storage)
 
-GPU: 1x A40 (48 GB VRAM), Container Disk: 50 GB, Volume Disk: 200 GB, Mount: /workspace
+IMPORTANT: Always use Secure Cloud, not Community Cloud.
+Community Cloud does NOT support network volumes — data is lost on crash/termination.
+
+### Pod Configuration
+
+- Cloud: **Secure Cloud** (not Community Cloud)
+- GPU: 1x A40 (48 GB VRAM) — $0.40/hr on Secure Cloud
+- Container Disk: 50 GB
+- Network Volume: **200 GB** (create FIRST in your target datacenter, then attach to pod)
+- Mount: /workspace
+- Template: RunPod PyTorch 2.4.0 / CUDA 12.1
+
+### Network Volume Setup (do this BEFORE creating the pod)
+
+1. Go to RunPod Dashboard > Storage > Network Volumes
+2. Create a 200 GB volume in your target datacenter region
+3. When creating the pod, select this volume under "Network Volume"
+4. Everything in /workspace persists even if the pod crashes or is deleted
+
+### Full Training Workflow
 
 ```bash
 # Setup
@@ -67,25 +86,14 @@ git clone https://github.com/EdikSimonian/armenian-gpt.git
 cd armenian-gpt
 pip install sentencepiece datasets huggingface_hub
 
-# Download all data (run each one)
-python data/download.py
-python data/download_cc100.py
-python data/download_culturax.py
-python data/download_oscar.py
-python data/download_mc4.py
-python data/download_hplt.py
-python data/download_glot500.py
+# Download all data (streaming mode, RAM-safe, auto-cleans HF cache)
+python data/download_all.py
 
-# Free space after downloads
-rm -rf ~/.cache/huggingface
-rm -f data/cc100_hy.txt.xz data/hywiki-latest-pages-articles.xml.bz2
-
-# Tokenize with BPE
+# Tokenize with BPE (chunked processing, RAM-safe)
 python data/prepare.py --tokenizer bpe
 
-# Free raw text after tokenizing
-rm -f data/raw_text.txt data/cc100_hy.txt data/oscar_hy.txt data/culturax_hy.txt
-rm -f data/mc4_hy.txt data/hplt_hy.txt data/glot500_hy.txt
+# Free raw text after tokenizing (~20-40 GB saved)
+rm -f data/raw_text.txt data/clean_text.txt
 
 # Train (A40-optimized: batch 16, accum 8 = effective 128)
 tmux new -s train
@@ -95,7 +103,7 @@ python train.py --preset xlarge --tokenizer bpe --batch_size 16 --grad_accum_ste
 python train.py --preset xlarge --tokenizer bpe --batch_size 16 --grad_accum_steps 8 --resume_from checkpoints/step_XXXXX.pt
 ```
 
-Estimated training time on A40: ~22 hours at $0.20/hr = ~$4.40 total.
+Estimated training time on A40: ~22 hours at $0.40/hr (Secure Cloud) = ~$8.80 total.
 
 ## Upload to HuggingFace
 
@@ -113,12 +121,17 @@ These are generated locally / on the training machine and excluded via .gitignor
 - `data/*.bin` — tokenized training data
 - `data/*.txt` — raw text files
 - `data/tokenizer.json` — trained tokenizer
+- `data/qa_parts/` — generated Q&A data
+- `data_chat/` — chat fine-tuning data
 - `checkpoints/` — model checkpoints
 - `data/*.bz2`, `data/*.model`, `data/*.vocab` — intermediate files
+- `pipeline_log.txt` — pipeline output log
 
 ## Conventions
 
-- All download scripts follow the same pattern: download() then merge() into raw_text.txt
+- `download_all.py` is the main entry point for data — downloads all sources with streaming
+- `prepare.py` processes text in chunks — safe for 20+ GB files
 - BPE tokenizer is recommended for xlarge; char tokenizer only for tiny/small
 - Checkpoints include model + optimizer + step + config (for resuming)
 - upload_to_hf.py strips optimizer state to reduce upload size
+- Download progress is tracked with `.{source}_done` marker files in data/ — allows safe resume if interrupted

@@ -4,6 +4,9 @@ Prepare Armenian text data for training.
 This script reads the raw text, builds a character vocabulary,
 encodes everything as integers, and saves train/val binary files.
 
+Memory-safe: processes text in chunks to handle 20+ GB files
+without loading everything into RAM.
+
 Usage:
     python data/prepare.py
     python data/prepare.py --tokenizer bpe   # for Level 2
@@ -11,15 +14,14 @@ Usage:
 After running, you'll have:
     data/train.bin  - training data (90%)
     data/val.bin    - validation data (10%)
-    data/vocab.json - character-to-integer mapping
+    data/tokenizer.json - tokenizer metadata
 """
 
 import os
 import sys
+import re
 import json
 import unicodedata
-import multiprocessing as mp
-from functools import partial
 import numpy as np
 
 # Add project root to path so we can import tokenizers
@@ -28,43 +30,193 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 RAW_FILE = os.path.join(DATA_DIR, "raw_text.txt")
 
+# Regex patterns compiled once
+_RE_NON_ARMENIAN = re.compile(r"[^\u0530-\u058F\uFB13-\uFB17 \n\t.,;:!?\-()\"'0-9]")
+_RE_SPACES = re.compile(r"[ \t]+")
+_RE_NEWLINES = re.compile(r"\n{3,}")
 
-def _clean_chunk(chunk):
-    """Worker function for parallel text cleaning."""
-    import re
+
+def clean_chunk(chunk):
+    """Clean a chunk of text. Keeps Armenian letters, punctuation, digits, whitespace."""
     chunk = unicodedata.normalize("NFC", chunk)
-    chunk = re.sub(r"[^\u0530-\u058F\uFB13-\uFB17 \n\t.,;:!?\-()\"'0-9]", "", chunk)
-    chunk = re.sub(r"[ \t]+", " ", chunk)
-    chunk = re.sub(r"\n{3,}", "\n\n", chunk)
+    chunk = _RE_NON_ARMENIAN.sub("", chunk)
+    chunk = _RE_SPACES.sub(" ", chunk)
+    chunk = _RE_NEWLINES.sub("\n\n", chunk)
     return chunk
 
 
-def clean_text(text):
+def get_file_size(path):
+    """Get file size in bytes."""
+    return os.path.getsize(path) if os.path.exists(path) else 0
+
+
+def clean_file_chunked(input_path, output_path, chunk_bytes=50_000_000):
     """
-    Clean and normalize Armenian text in parallel.
-    Keeps Armenian letters, common punctuation, digits, and whitespace.
+    Clean the raw text file in chunks, writing cleaned output to a new file.
+    Never loads more than ~50 MB into RAM at a time.
     """
-    CHUNK_SIZE = 5_000_000  # 5M chars per chunk
-    # Split on newlines to avoid breaking mid-line
-    chunks = []
-    for i in range(0, len(text), CHUNK_SIZE):
-        chunks.append(text[i:i + CHUNK_SIZE])
+    total_bytes = get_file_size(input_path)
+    total_mb = total_bytes / (1024 * 1024)
+    processed = 0
+    out_chars = 0
 
-    num_workers = mp.cpu_count()
-    print(f"  Cleaning {len(chunks)} chunks across {num_workers} CPUs...")
-    with mp.Pool(num_workers) as pool:
-        cleaned = pool.map(_clean_chunk, chunks)
+    print(f"  Cleaning {total_mb:.0f} MB in ~{chunk_bytes // 1_000_000} MB chunks...")
 
-    text = "".join(cleaned)
-    text = text.strip()
-    return text
+    with open(input_path, "r", encoding="utf-8") as fin, \
+         open(output_path, "w", encoding="utf-8") as fout:
+        buffer = ""
+        while True:
+            raw = fin.read(chunk_bytes)
+            if not raw:
+                # Process remaining buffer
+                if buffer:
+                    cleaned = clean_chunk(buffer)
+                    fout.write(cleaned)
+                    out_chars += len(cleaned)
+                break
+
+            buffer += raw
+            processed += len(raw.encode("utf-8"))
+
+            # Find last newline to avoid splitting mid-line
+            last_nl = buffer.rfind("\n")
+            if last_nl == -1:
+                # No newline in buffer — keep accumulating
+                continue
+
+            # Clean everything up to the last newline
+            to_clean = buffer[:last_nl + 1]
+            buffer = buffer[last_nl + 1:]
+
+            cleaned = clean_chunk(to_clean)
+            fout.write(cleaned)
+            out_chars += len(cleaned)
+
+            pct = min(100, processed * 100 / total_bytes) if total_bytes > 0 else 0
+            print(f"  {pct:.0f}% ({processed / (1024**2):.0f}/{total_mb:.0f} MB) — "
+                  f"{out_chars / 1_000_000:.0f}M clean chars")
+
+    print(f"  Cleaned: {out_chars:,} characters")
+    return out_chars
 
 
-def _encode_chunk(chunk, model_file):
-    """Worker function for parallel BPE encoding."""
-    import sentencepiece as spm
-    sp = spm.SentencePieceProcessor(model_file=model_file)
-    return sp.encode(chunk)
+def build_char_vocab(clean_path, chunk_bytes=50_000_000):
+    """Scan the clean file to build character vocabulary without loading it all."""
+    from tokenizers.char_tokenizer import CharTokenizer
+    tokenizer = CharTokenizer()
+    chars = set()
+
+    with open(clean_path, "r", encoding="utf-8") as f:
+        while True:
+            chunk = f.read(chunk_bytes)
+            if not chunk:
+                break
+            chars.update(chunk)
+
+    # Build vocab from sorted unique characters
+    tokenizer.itos = sorted(chars)
+    tokenizer.stoi = {ch: i for i, ch in enumerate(tokenizer.itos)}
+    return tokenizer
+
+
+def encode_char_chunked(clean_path, tokenizer, output_path, chunk_bytes=50_000_000):
+    """Encode text file to token IDs in chunks, appending to output binary file."""
+    max_cp = max(ord(ch) for ch in tokenizer.stoi) + 1
+    lookup = np.full(max_cp, -1, dtype=np.int32)
+    for ch, idx in tokenizer.stoi.items():
+        lookup[ord(ch)] = idx
+
+    total_tokens = 0
+    with open(clean_path, "r", encoding="utf-8") as fin, \
+         open(output_path, "wb") as fout:
+        while True:
+            chunk = fin.read(chunk_bytes)
+            if not chunk:
+                break
+            codepoints = np.array([ord(ch) for ch in chunk], dtype=np.int32)
+            token_ids = lookup[codepoints]
+            token_ids = token_ids[token_ids >= 0].astype(np.uint16)
+            token_ids.tofile(fout)
+            total_tokens += len(token_ids)
+
+    return total_tokens
+
+
+def encode_bpe_chunked(clean_path, tokenizer, output_path, chunk_bytes=10_000_000):
+    """Encode text file with BPE in chunks, appending to output binary file."""
+    total_tokens = 0
+    total_bytes = get_file_size(clean_path)
+
+    with open(clean_path, "r", encoding="utf-8") as fin, \
+         open(output_path, "wb") as fout:
+        buffer = ""
+        processed = 0
+        while True:
+            raw = fin.read(chunk_bytes)
+            if not raw:
+                if buffer:
+                    ids = tokenizer.encode(buffer)
+                    np.array(ids, dtype=np.uint16).tofile(fout)
+                    total_tokens += len(ids)
+                break
+
+            buffer += raw
+            processed += len(raw.encode("utf-8"))
+
+            # Split on paragraph boundary to avoid cutting mid-word
+            last_para = buffer.rfind("\n\n")
+            if last_para == -1:
+                last_nl = buffer.rfind("\n")
+                if last_nl == -1:
+                    continue
+                last_para = last_nl
+
+            to_encode = buffer[:last_para + 1]
+            buffer = buffer[last_para + 1:]
+
+            ids = tokenizer.encode(to_encode)
+            np.array(ids, dtype=np.uint16).tofile(fout)
+            total_tokens += len(ids)
+
+            pct = min(100, processed * 100 / total_bytes) if total_bytes > 0 else 0
+            if int(pct) % 5 == 0:
+                print(f"  Encoding: {pct:.0f}% — {total_tokens:,} tokens so far")
+
+    return total_tokens
+
+
+def split_bin_file(all_tokens_path, train_path, val_path, val_ratio=0.1):
+    """Split a single .bin file into train and val without loading into RAM."""
+    total_bytes = get_file_size(all_tokens_path)
+    total_tokens = total_bytes // 2  # uint16 = 2 bytes per token
+    split_token = int(total_tokens * (1 - val_ratio))
+    split_byte = split_token * 2
+
+    print(f"  Total tokens: {total_tokens:,}")
+    print(f"  Train: {split_token:,} tokens, Val: {total_tokens - split_token:,} tokens")
+
+    # Copy chunks to train file
+    chunk_size = 100 * 1024 * 1024  # 100 MB
+    with open(all_tokens_path, "rb") as fin:
+        with open(train_path, "wb") as fout:
+            remaining = split_byte
+            while remaining > 0:
+                to_read = min(chunk_size, remaining)
+                data = fin.read(to_read)
+                if not data:
+                    break
+                fout.write(data)
+                remaining -= len(data)
+
+        with open(val_path, "wb") as fout:
+            while True:
+                data = fin.read(chunk_size)
+                if not data:
+                    break
+                fout.write(data)
+
+    print(f"  Train: {os.path.getsize(train_path) / 1024 / 1024:.1f} MB")
+    print(f"  Val:   {os.path.getsize(val_path) / 1024 / 1024:.1f} MB")
 
 
 def main():
@@ -75,86 +227,61 @@ def main():
                         help="Tokenizer type: 'char' (Level 1) or 'bpe' (Level 2)")
     args = parser.parse_args()
 
-    # Step 1: Read raw text
+    # Step 1: Check raw text exists
     if not os.path.exists(RAW_FILE):
         print(f"Error: {RAW_FILE} not found!")
-        print("Run 'python data/download.py' first to download the data.")
+        print("Run 'python data/download_all.py' first to download the data.")
         sys.exit(1)
 
-    print(f"Reading {RAW_FILE}...")
-    with open(RAW_FILE, "r", encoding="utf-8") as f:
-        raw_text = f.read()
-    print(f"  Raw text: {len(raw_text):,} characters")
+    raw_size = get_file_size(RAW_FILE)
+    print(f"\n{'='*50}")
+    print(f"  ArmGPT Data Preparation (memory-safe)")
+    print(f"{'='*50}")
+    print(f"  Raw text: {RAW_FILE} ({raw_size / 1024 / 1024:.0f} MB)")
+    print(f"  Tokenizer: {args.tokenizer}")
+    print(f"{'='*50}\n")
 
-    # Step 2: Clean the text
-    print("Cleaning text...")
-    text = clean_text(raw_text)
-    print(f"  Cleaned text: {len(text):,} characters")
+    # Step 2: Clean text in chunks -> clean_text.txt
+    clean_path = os.path.join(DATA_DIR, "clean_text.txt")
+    print("Step 1: Cleaning text...")
+    clean_file_chunked(RAW_FILE, clean_path)
 
-    # Step 3: Initialize tokenizer
+    # Step 3: Build tokenizer
+    print("\nStep 2: Building tokenizer...")
+    all_tokens_path = os.path.join(DATA_DIR, "all_tokens.bin")
+
     if args.tokenizer == "char":
-        from tokenizers.char_tokenizer import CharTokenizer
-        tokenizer = CharTokenizer()
-        tokenizer.build_vocab(text)
+        tokenizer = build_char_vocab(clean_path)
+        print(f"  Vocabulary: {tokenizer.vocab_size} characters")
+
+        # Step 4: Encode in chunks
+        print("\nStep 3: Encoding text...")
+        total_tokens = encode_char_chunked(clean_path, tokenizer, all_tokens_path)
     else:
         from tokenizers.bpe_tokenizer import BPETokenizer
         tokenizer = BPETokenizer()
-        # Save text temporarily for SentencePiece training
-        tmp_file = os.path.join(DATA_DIR, "clean_text.txt")
-        with open(tmp_file, "w", encoding="utf-8") as f:
-            f.write(text)
-        tokenizer.train(tmp_file, model_prefix=os.path.join(DATA_DIR, "bpe_model"))
+        tokenizer.train(clean_path, model_prefix=os.path.join(DATA_DIR, "bpe_model"))
+        print(f"  Vocabulary: {tokenizer.vocab_size} tokens")
 
-    print(f"  Vocabulary size: {tokenizer.vocab_size}")
+        # Step 4: Encode in chunks
+        print("\nStep 3: Encoding text...")
+        total_tokens = encode_bpe_chunked(clean_path, tokenizer, all_tokens_path)
 
-    # Step 4: Encode the text
-    print("Encoding text...")
-    if args.tokenizer == "char":
-        # Fast path: use numpy for bulk encoding instead of Python loop
-        # Build a lookup table: Unicode codepoint -> token ID
-        max_cp = max(ord(ch) for ch in tokenizer.stoi) + 1
-        lookup = np.full(max_cp, -1, dtype=np.int32)
-        for ch, idx in tokenizer.stoi.items():
-            lookup[ord(ch)] = idx
-        # Convert text to array of codepoints, then map to token IDs
-        codepoints = np.array([ord(ch) for ch in text], dtype=np.int32)
-        token_ids = lookup[codepoints]
-        # Remove characters not in vocab (mapped to -1)
-        token_ids = token_ids[token_ids >= 0].astype(np.uint16)
-    else:
-        # Parallel encode with streaming results to avoid memory explosion
-        CHUNK_SIZE = 1_000_000  # characters per chunk
-        total_chars = len(text)
-        text_chunks = [text[i:i + CHUNK_SIZE] for i in range(0, total_chars, CHUNK_SIZE)]
-        num_chunks = len(text_chunks)
-        num_workers = mp.cpu_count()
-        print(f"  Encoding {num_chunks} chunks across {num_workers} CPUs...")
+    print(f"  Total tokens: {total_tokens:,}")
 
-        model_file = os.path.join(DATA_DIR, "bpe_model.model")
-        all_ids = []
-        with mp.Pool(num_workers) as pool:
-            for i, ids in enumerate(pool.imap(partial(_encode_chunk, model_file=model_file), text_chunks)):
-                all_ids.append(np.array(ids, dtype=np.uint16))
-                if i % 100 == 0:
-                    done = min((i + 1) * CHUNK_SIZE, total_chars)
-                    print(f"  {done:,}/{total_chars:,} chars ({100*done/total_chars:.0f}%)")
-
-        token_ids = np.concatenate(all_ids)
-    print(f"  Total tokens: {len(token_ids):,}")
-
-    # Step 5: Split into train and validation (90/10)
-    split_idx = int(len(token_ids) * 0.9)
-    train_ids = token_ids[:split_idx]
-    val_ids = token_ids[split_idx:]
-
-    # Step 6: Save binary files
+    # Step 5: Split into train/val
+    print("\nStep 4: Splitting train/val (90/10)...")
     train_path = os.path.join(DATA_DIR, "train.bin")
     val_path = os.path.join(DATA_DIR, "val.bin")
-    train_ids.tofile(train_path)
-    val_ids.tofile(val_path)
+    split_bin_file(all_tokens_path, train_path, val_path)
 
-    # Step 7: Save tokenizer info
-    tokenizer.save(os.path.join(DATA_DIR, "tokenizer.json"))
+    # Clean up temporary files
+    os.remove(all_tokens_path)
+    print(f"\n  Removed temporary file: all_tokens.bin")
+
+    # Step 6: Save tokenizer
+    tok_path = os.path.join(DATA_DIR, "tokenizer.json")
+    tokenizer.save(tok_path)
 
     # Print summary
     print(f"\n{'='*50}")
@@ -162,31 +289,28 @@ def main():
     print(f"{'='*50}")
     print(f"  Tokenizer:    {args.tokenizer}")
     print(f"  Vocab size:   {tokenizer.vocab_size}")
-    print(f"  Train tokens: {len(train_ids):,} ({train_path})")
-    print(f"  Val tokens:   {len(val_ids):,} ({val_path})")
+    print(f"  Train tokens: {os.path.getsize(train_path) // 2:,} ({train_path})")
+    print(f"  Val tokens:   {os.path.getsize(val_path) // 2:,} ({val_path})")
     print(f"  Train size:   {os.path.getsize(train_path) / 1024 / 1024:.1f} MB")
     print(f"  Val size:     {os.path.getsize(val_path) / 1024 / 1024:.1f} MB")
-    print()
+    print(f"  Tokenizer:    {tok_path}")
 
-    # Show a sample of the vocabulary
-    print("Sample vocabulary (first 20 tokens):")
-    if args.tokenizer == "char":
-        for i, ch in enumerate(tokenizer.itos[:20]):
-            display = repr(ch) if ch in (" ", "\n", "\t") else ch
-            print(f"  {i:3d} -> {display}")
-    print()
+    # Optional: delete clean_text.txt to save space
+    clean_size = get_file_size(clean_path)
+    print(f"\n  Note: clean_text.txt ({clean_size / 1024 / 1024:.0f} MB) can be deleted to save space:")
+    print(f"    rm {clean_path}")
 
     # Show a sample encode/decode round-trip
-    sample = text[:100]
+    with open(clean_path, "r", encoding="utf-8") as f:
+        sample = f.read(200)
     encoded = tokenizer.encode(sample)
     decoded = tokenizer.decode(encoded)
-    print("Sample round-trip test:")
+    print(f"\nSample round-trip test:")
     try:
-        print(f"  Original:  {sample[:60]}...")
-        print(f"  Decoded:   {decoded[:60]}...")
+        print(f"  Original:  {sample[:80]}...")
+        print(f"  Decoded:   {decoded[:80]}...")
     except UnicodeEncodeError:
-        print(f"  Original:  (contains non-ASCII characters)")
-        print(f"  Decoded:   (contains non-ASCII characters)")
+        print(f"  (contains non-ASCII characters)")
     print(f"  Encoded:   {encoded[:20]}...")
     print(f"  Match: {'YES' if sample == decoded else 'NO'}")
 
