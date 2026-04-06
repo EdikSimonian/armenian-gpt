@@ -13,6 +13,9 @@ data_chat/
 
 # Pipeline logs
 pipeline_log.txt
+train.log
+watchdog.log
+stop_monitor.log
 
 # Checkpoints
 checkpoints/

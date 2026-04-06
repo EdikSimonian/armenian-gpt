@@ -191,6 +191,20 @@ def main():
     metrics = {"steps": [], "train_loss": [], "val_loss": [],
                "perplexity": [], "tokens_per_sec": [], "accuracy": []}
 
+    # Graceful shutdown on SIGTERM/SIGINT — save checkpoint before exiting
+    import signal
+    _shutdown_requested = False
+    _current_step = [0]
+
+    def _shutdown_handler(signum, frame):
+        nonlocal _shutdown_requested
+        _shutdown_requested = True
+        sig_name = signal.Signals(signum).name
+        print(f"\n{sig_name} received at step {_current_step[0]}. Saving checkpoint and exiting...")
+
+    signal.signal(signal.SIGTERM, _shutdown_handler)
+    signal.signal(signal.SIGINT, _shutdown_handler)
+
     # Training loop
     grad_accum = cfg.get("grad_accum_steps", 1)
     tokens_per_step = cfg["batch_size"] * cfg["block_size"] * grad_accum
@@ -203,6 +217,32 @@ def main():
     tps = 0
 
     for step in range(start_iter, cfg["max_iters"]):
+        _current_step[0] = step
+
+        # Check for graceful shutdown
+        if _shutdown_requested:
+            ckpt_path = os.path.join(cfg["checkpoint_dir"], f"step_{step}.pt")
+            torch.save({
+                "model": model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "step": step,
+                "config": cfg,
+            }, ckpt_path)
+            print(f"Emergency checkpoint saved: {ckpt_path}")
+            if cfg.get("hf_repo"):
+                try:
+                    from huggingface_hub import HfApi
+                    HfApi().upload_file(
+                        path_or_fileobj=ckpt_path,
+                        path_in_repo=f"checkpoints/step_{step}.pt",
+                        repo_id=cfg["hf_repo"],
+                        repo_type="model",
+                    )
+                    print(f"  Uploaded to HF: step_{step}.pt")
+                except Exception as e:
+                    print(f"  HF upload failed: {e}")
+            print(f"Graceful shutdown complete at step {step}.")
+            sys.exit(0)
         # Update learning rate
         lr = get_lr(step, cfg)
         for param_group in optimizer.param_groups:
@@ -315,22 +355,27 @@ def main():
                 "config": cfg,
             }, ckpt_path)
             print(f"Checkpoint saved: {ckpt_path}")
-            # Upload checkpoint to HF in background
+            # Upload checkpoint to HF in background with retries
             if cfg.get("hf_repo"):
                 import threading
-                def _upload_ckpt(path, repo, step_num):
-                    try:
-                        from huggingface_hub import HfApi
-                        api = HfApi()
-                        api.upload_file(
-                            path_or_fileobj=path,
-                            path_in_repo=f"checkpoints/step_{step_num}.pt",
-                            repo_id=repo,
-                            repo_type="model",
-                        )
-                        print(f"  Uploaded {path} to HF")
-                    except Exception as e:
-                        print(f"  HF upload failed: {e}")
+                def _upload_ckpt(path, repo, step_num, retries=3):
+                    from huggingface_hub import HfApi
+                    api = HfApi()
+                    for attempt in range(retries):
+                        try:
+                            api.upload_file(
+                                path_or_fileobj=path,
+                                path_in_repo=f"checkpoints/step_{step_num}.pt",
+                                repo_id=repo,
+                                repo_type="model",
+                            )
+                            print(f"  Uploaded step_{step_num}.pt to HF")
+                            return
+                        except Exception as e:
+                            print(f"  HF upload attempt {attempt+1}/{retries} failed: {e}")
+                            if attempt < retries - 1:
+                                import time as _t; _t.sleep(30)
+                    print(f"  HF upload FAILED after {retries} attempts: step_{step_num}.pt")
                 threading.Thread(target=_upload_ckpt, args=(ckpt_path, cfg["hf_repo"], step), daemon=True).start()
 
     # Save final checkpoint
