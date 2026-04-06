@@ -5,6 +5,12 @@ data/*.bz2
 data/*.model
 data/*.vocab
 data/tokenizer.json
+data/tokenizer_char.json
+data/qa_parts/
+data_chat/
+
+# Pipeline logs
+pipeline_log.txt
 
 # Checkpoints
 checkpoints/
