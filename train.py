@@ -18,6 +18,10 @@ What happens during training:
 
 import os
 import sys
+
+# Force unbuffered output so logs appear immediately when piped
+os.environ["PYTHONUNBUFFERED"] = "1"
+
 import time
 import json
 import math
@@ -38,15 +42,12 @@ def load_data(data_dir, device):
         print("Run 'python data/download.py' and 'python data/prepare.py' first.")
         sys.exit(1)
 
-    # Load data into RAM as a contiguous torch tensor for fast batch creation
-    # This avoids slow memmap access on every batch (especially on Windows)
-    print("Loading data into memory...")
-    train_np = np.fromfile(train_path, dtype=np.uint16)
-    val_np = np.fromfile(val_path, dtype=np.uint16)
-    train_data = torch.from_numpy(train_np.astype(np.int64))
-    val_data = torch.from_numpy(val_np.astype(np.int64))
-    print(f"  Train: {len(train_data):,} tokens ({len(train_data)*2/1024/1024:.0f} MB)")
-    print(f"  Val:   {len(val_data):,} tokens ({len(val_data)*2/1024/1024:.0f} MB)")
+    # Memory-map to avoid loading multi-GB datasets into RAM
+    print("Loading data...")
+    train_data = np.memmap(train_path, dtype=np.uint16, mode="r")
+    val_data = np.memmap(val_path, dtype=np.uint16, mode="r")
+    print(f"  Train: {len(train_data):,} tokens ({os.path.getsize(train_path)/1024/1024:.0f} MB)")
+    print(f"  Val:   {len(val_data):,} tokens ({os.path.getsize(val_path)/1024/1024:.0f} MB)")
     return train_data, val_data
 
 
@@ -69,11 +70,11 @@ def load_tokenizer(data_dir, tokenizer_type):
 
 
 def get_batch(data, block_size, batch_size, device):
-    """Grab a random batch of sequences from the data. Fast, no Python loops."""
+    """Grab a random batch of sequences from the data."""
     ix = torch.randint(len(data) - block_size - 1, (batch_size,))
-    x = torch.stack([data[i:i+block_size] for i in ix]).to(device)
-    y = torch.stack([data[i+1:i+1+block_size] for i in ix]).to(device)
-    return x, y
+    x = torch.stack([torch.from_numpy(data[i:i+block_size].astype(np.int64)) for i in ix])
+    y = torch.stack([torch.from_numpy(data[i+1:i+1+block_size].astype(np.int64)) for i in ix])
+    return x.to(device), y.to(device)
 
 
 @torch.no_grad()
@@ -104,6 +105,13 @@ def get_lr(step, cfg):
     return cfg["min_lr"] + coeff * (cfg["learning_rate"] - cfg["min_lr"])
 
 
+def fmt_time(seconds):
+    """Format seconds as HH:MM:SS."""
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def main():
     cfg = get_config()
     device = cfg["device"]
@@ -119,6 +127,8 @@ def main():
     print(f"  Batch size:  {cfg['batch_size']}")
     print(f"  Max iters:   {cfg['max_iters']}")
     print(f"  Tokenizer:   {cfg['tokenizer']}")
+    print(f"  Grad accum:  {cfg.get('grad_accum_steps', 1)} (eff. batch = {cfg['batch_size'] * cfg.get('grad_accum_steps', 1)})")
+    print(f"  LR:          {cfg['learning_rate']}")
     print(f"  AMP:         {'enabled' if use_amp else 'disabled'}")
     print(f"{'='*50}\n")
 
@@ -165,10 +175,13 @@ def main():
                "perplexity": [], "tokens_per_sec": [], "accuracy": []}
 
     # Training loop
-    tokens_per_step = cfg["batch_size"] * cfg["block_size"]
+    grad_accum = cfg.get("grad_accum_steps", 1)
+    tokens_per_step = cfg["batch_size"] * cfg["block_size"] * grad_accum
+    print(f"  Grad accum:  {grad_accum} steps (effective batch = {cfg['batch_size'] * grad_accum})")
     print(f"\nStarting training from step {start_iter}...\n")
     model.train()
     t0 = time.time()
+    train_start = time.time()
     running_loss = 0.0
 
     for step in range(start_iter, cfg["max_iters"]):
@@ -177,17 +190,14 @@ def main():
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        # Get a batch and do forward + backward pass with mixed precision
-        x, y = get_batch(train_data, cfg["block_size"], cfg["batch_size"], device)
-
-        with torch.amp.autocast(device_type="cuda", enabled=use_amp):
-            logits, loss = model(x, y)
-
-        # Accumulate loss without syncing GPU (fast)
-        running_loss += loss.detach()
-
-        # Backward pass with gradient scaling
-        scaler.scale(loss).backward()
+        # Gradient accumulation: run multiple micro-batches before updating
+        for micro_step in range(grad_accum):
+            x, y = get_batch(train_data, cfg["block_size"], cfg["batch_size"], device)
+            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                logits, loss = model(x, y)
+                loss = loss / grad_accum  # scale loss by accumulation steps
+            running_loss += loss.detach()
+            scaler.scale(loss).backward()
 
         # Clip gradients to prevent explosions
         if cfg["grad_clip"] > 0:
@@ -207,18 +217,17 @@ def main():
             dt = time.time() - t0
             steps_done = cfg["log_interval"]
             tps = tokens_per_step * steps_done / dt
-            elapsed = time.time() - t0
             t0 = time.time()
 
-            # ETA calculation
-            steps_remaining = cfg["max_iters"] - step
-            secs_per_step = dt / steps_done
-            eta_secs = int(steps_remaining * secs_per_step)
-            eta_h, eta_m, eta_s = eta_secs // 3600, (eta_secs % 3600) // 60, eta_secs % 60
+            # Time estimates
+            elapsed = time.time() - train_start
+            iters_done = step - start_iter
+            iters_left = cfg["max_iters"] - step
+            eta = (elapsed / iters_done) * iters_left if iters_done > 0 else 0
 
             print(f"step {step:5d}/{cfg['max_iters']} | loss {avg_loss:.4f} | "
                   f"lr {lr:.2e} | {tps:,.0f} tok/s | "
-                  f"eta {eta_h:02d}:{eta_m:02d}:{eta_s:02d}")
+                  f"elapsed {fmt_time(elapsed)} | eta {fmt_time(eta)}")
 
         # Evaluate and generate samples
         if step > 0 and step % cfg["eval_interval"] == 0:
@@ -270,7 +279,9 @@ def main():
                                        temperature=0.8, top_k=40)
             text = tokenizer.decode(generated[0].tolist())
             print(f"\n--- Sample (step {step}) ---")
-            print(text)
+            sys.stdout.buffer.write(text.encode("utf-8", errors="replace"))
+            sys.stdout.buffer.write(b"\n")
+            sys.stdout.buffer.flush()
             print("--- End sample ---\n")
             model.train()
             t0 = time.time()
@@ -300,9 +311,11 @@ def main():
     losses = estimate_loss(model, train_data, val_data, cfg)
     perplexity = math.exp(min(losses["val"], 20))
 
+    elapsed = time.time() - train_start
     print(f"\n{'='*50}")
     print(f"  Training Complete!")
     print(f"{'='*50}")
+    print(f"  Total time:       {fmt_time(elapsed)}")
     print(f"  Final train loss: {losses['train']:.4f}")
     print(f"  Final val loss:   {losses['val']:.4f}")
     print(f"  Final perplexity: {perplexity:.2f}")

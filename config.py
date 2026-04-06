@@ -46,9 +46,10 @@ PRESETS = {
         n_head=12,
         n_embd=768,
         block_size=512,
-        batch_size=64,
+        batch_size=16,
+        grad_accum_steps=4,  # effective batch = 16*4 = 64
         max_iters=20000,
-        learning_rate=3e-4,
+        learning_rate=1e-4,
         eval_interval=1000,
     ),
     # Stage 2: fine-tuning on conversational data
@@ -82,6 +83,7 @@ warmup_iters = 100   # linear warmup steps
 min_lr = 1e-4        # minimum learning rate after decay
 weight_decay = 0.1   # AdamW weight decay
 grad_clip = 1.0      # gradient clipping (0 = no clipping)
+grad_accum_steps = 1 # gradient accumulation steps (effective batch = batch_size * this)
 
 # evaluation and logging
 eval_interval = 500  # evaluate every N steps
@@ -118,8 +120,13 @@ def get_config():
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--max_iters", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
+    parser.add_argument("--grad_accum_steps", type=int, default=None)
     parser.add_argument("--tokenizer", type=str, default=None,
                         choices=["char", "bpe"])
+    parser.add_argument("--eval_interval", type=int, default=None)
+    parser.add_argument("--save_interval", type=int, default=None)
+    parser.add_argument("--sample_interval", type=int, default=None)
+    parser.add_argument("--log_interval", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--data_dir", type=str, default=None)
     parser.add_argument("--resume_from", type=str, default=None)

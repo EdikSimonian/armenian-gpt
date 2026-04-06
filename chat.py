@@ -32,8 +32,12 @@ def load_tokenizer(data_dir):
     with open(tok_path, "r", encoding="utf-8") as f:
         tok_data = json.load(f)
 
-    from tokenizers.char_tokenizer import CharTokenizer
-    return CharTokenizer.load(tok_path)
+    if tok_data.get("type") == "bpe":
+        from tokenizers.bpe_tokenizer import BPETokenizer
+        return BPETokenizer.load(tok_path)
+    else:
+        from tokenizers.char_tokenizer import CharTokenizer
+        return CharTokenizer.load(tok_path)
 
 
 def main():
@@ -62,6 +66,12 @@ def main():
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     cfg = checkpoint["config"]
 
+    # Infer model architecture from saved weights (config may be stale)
+    state = checkpoint["model"]
+    cfg["n_embd"] = state["transformer.wte.weight"].shape[1]
+    cfg["n_layer"] = max(int(k.split(".")[2]) for k in state if k.startswith("transformer.blocks.")) + 1
+    cfg["block_size"] = state["transformer.blocks.0.attn.bias"].shape[-1]
+
     # Determine device
     if torch.cuda.is_available():
         device = "cuda"
@@ -74,13 +84,13 @@ def main():
     tokenizer = load_tokenizer(args.data_dir)
 
     # Get special token IDs
-    end_token_id = tokenizer.stoi.get("<|end|>")
-    user_token_id = tokenizer.stoi.get("<|user|>")
+    end_ids = tokenizer.encode("<|end|>")
+    user_ids = tokenizer.encode("<|user|>")
     stop_tokens = set()
-    if end_token_id is not None:
-        stop_tokens.add(end_token_id)
-    if user_token_id is not None:
-        stop_tokens.add(user_token_id)
+    if end_ids:
+        stop_tokens.add(end_ids[0])
+    if user_ids:
+        stop_tokens.add(user_ids[0])
 
     # Create model and load weights
     model = GPT(

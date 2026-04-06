@@ -18,6 +18,8 @@ import os
 import sys
 import json
 import unicodedata
+import multiprocessing as mp
+from functools import partial
 import numpy as np
 
 # Add project root to path so we can import tokenizers
@@ -27,29 +29,42 @@ DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 RAW_FILE = os.path.join(DATA_DIR, "raw_text.txt")
 
 
+def _clean_chunk(chunk):
+    """Worker function for parallel text cleaning."""
+    import re
+    chunk = unicodedata.normalize("NFC", chunk)
+    chunk = re.sub(r"[^\u0530-\u058F\uFB13-\uFB17 \n\t.,;:!?\-()\"'0-9]", "", chunk)
+    chunk = re.sub(r"[ \t]+", " ", chunk)
+    chunk = re.sub(r"\n{3,}", "\n\n", chunk)
+    return chunk
+
+
 def clean_text(text):
     """
-    Clean and normalize Armenian text.
+    Clean and normalize Armenian text in parallel.
     Keeps Armenian letters, common punctuation, digits, and whitespace.
-    Uses regex for speed — handles 900M+ characters in under a minute.
     """
-    import re
+    CHUNK_SIZE = 5_000_000  # 5M chars per chunk
+    # Split on newlines to avoid breaking mid-line
+    chunks = []
+    for i in range(0, len(text), CHUNK_SIZE):
+        chunks.append(text[i:i + CHUNK_SIZE])
 
-    # Normalize Unicode (combine accents, standardize characters)
-    text = unicodedata.normalize("NFC", text)
+    num_workers = mp.cpu_count()
+    print(f"  Cleaning {len(chunks)} chunks across {num_workers} CPUs...")
+    with mp.Pool(num_workers) as pool:
+        cleaned = pool.map(_clean_chunk, chunks)
 
-    # Remove everything that is NOT Armenian, punctuation, digits, or whitespace
-    # Armenian Unicode block: U+0530-U+058F, ligatures: U+FB13-U+FB17
-    print("  Filtering characters...")
-    text = re.sub(r"[^\u0530-\u058F\uFB13-\uFB17 \n\t.,;:!?\-()\"'0-9]", "", text)
-
-    # Collapse multiple spaces/tabs into one space
-    print("  Collapsing whitespace...")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = "".join(cleaned)
     text = text.strip()
-
     return text
+
+
+def _encode_chunk(chunk, model_file):
+    """Worker function for parallel BPE encoding."""
+    import sentencepiece as spm
+    sp = spm.SentencePieceProcessor(model_file=model_file)
+    return sp.encode(chunk)
 
 
 def main():
@@ -107,7 +122,24 @@ def main():
         # Remove characters not in vocab (mapped to -1)
         token_ids = token_ids[token_ids >= 0].astype(np.uint16)
     else:
-        token_ids = np.array(tokenizer.encode(text), dtype=np.uint16)
+        # Parallel encode with streaming results to avoid memory explosion
+        CHUNK_SIZE = 1_000_000  # characters per chunk
+        total_chars = len(text)
+        text_chunks = [text[i:i + CHUNK_SIZE] for i in range(0, total_chars, CHUNK_SIZE)]
+        num_chunks = len(text_chunks)
+        num_workers = mp.cpu_count()
+        print(f"  Encoding {num_chunks} chunks across {num_workers} CPUs...")
+
+        model_file = os.path.join(DATA_DIR, "bpe_model.model")
+        all_ids = []
+        with mp.Pool(num_workers) as pool:
+            for i, ids in enumerate(pool.imap(partial(_encode_chunk, model_file=model_file), text_chunks)):
+                all_ids.append(np.array(ids, dtype=np.uint16))
+                if i % 100 == 0:
+                    done = min((i + 1) * CHUNK_SIZE, total_chars)
+                    print(f"  {done:,}/{total_chars:,} chars ({100*done/total_chars:.0f}%)")
+
+        token_ids = np.concatenate(all_ids)
     print(f"  Total tokens: {len(token_ids):,}")
 
     # Step 5: Split into train and validation (90/10)
@@ -149,9 +181,13 @@ def main():
     encoded = tokenizer.encode(sample)
     decoded = tokenizer.decode(encoded)
     print("Sample round-trip test:")
-    print(f"  Original:  {sample[:60]}...")
+    try:
+        print(f"  Original:  {sample[:60]}...")
+        print(f"  Decoded:   {decoded[:60]}...")
+    except UnicodeEncodeError:
+        print(f"  Original:  (contains non-ASCII characters)")
+        print(f"  Decoded:   (contains non-ASCII characters)")
     print(f"  Encoded:   {encoded[:20]}...")
-    print(f"  Decoded:   {decoded[:60]}...")
     print(f"  Match: {'YES' if sample == decoded else 'NO'}")
 
 

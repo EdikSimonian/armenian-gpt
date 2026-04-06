@@ -146,26 +146,37 @@ def main():
         print("  python data/prepare.py")
         sys.exit(1)
 
-    from tokenizers.char_tokenizer import CharTokenizer
-    tokenizer = CharTokenizer.load(stage1_tok_path)
+    # Detect tokenizer type from saved metadata
+    with open(stage1_tok_path, "r", encoding="utf-8") as f:
+        tok_meta = json.load(f)
+    tok_type = tok_meta.get("type", "char")
+
+    if tok_type == "bpe":
+        from tokenizers.bpe_tokenizer import BPETokenizer
+        tokenizer = BPETokenizer.load(stage1_tok_path)
+    else:
+        from tokenizers.char_tokenizer import CharTokenizer
+        tokenizer = CharTokenizer.load(stage1_tok_path)
+
     old_vocab_size = tokenizer.vocab_size
-    print(f"\nStage 1 vocabulary: {old_vocab_size} tokens")
+    print(f"\nStage 1 vocabulary: {old_vocab_size} tokens (type: {tok_type})")
 
     # Add special chat tokens
     tokenizer.add_special_tokens([USER_TOKEN, ASSISTANT_TOKEN, END_TOKEN])
     print(f"Extended vocabulary: {tokenizer.vocab_size} tokens (+{tokenizer.vocab_size - old_vocab_size} special)")
 
-    # Also add any new characters from the Alpaca data that weren't in Wikipedia
-    new_chars = set()
-    for ch in text:
-        if ch not in tokenizer.stoi and len(ch) == 1:
-            new_chars.add(ch)
-    if new_chars:
-        for ch in sorted(new_chars):
-            tokenizer.stoi[ch] = len(tokenizer.itos)
-            tokenizer.itos.append(ch)
-        print(f"  Added {len(new_chars)} new characters from Alpaca data")
-        print(f"  Final vocabulary: {tokenizer.vocab_size} tokens")
+    # For char tokenizer, also add new characters from Alpaca data
+    if tok_type == "char":
+        new_chars = set()
+        for ch in text:
+            if ch not in tokenizer.stoi and len(ch) == 1:
+                new_chars.add(ch)
+        if new_chars:
+            for ch in sorted(new_chars):
+                tokenizer.stoi[ch] = len(tokenizer.itos)
+                tokenizer.itos.append(ch)
+            print(f"  Added {len(new_chars)} new characters from Alpaca data")
+            print(f"  Final vocabulary: {tokenizer.vocab_size} tokens")
 
     # Step 6: Encode the text
     print("Encoding text...")
@@ -201,16 +212,19 @@ def main():
 
     # Show special token IDs
     print(f"\nSpecial tokens:")
-    print(f"  {USER_TOKEN:15s} -> {tokenizer.stoi[USER_TOKEN]}")
-    print(f"  {ASSISTANT_TOKEN:15s} -> {tokenizer.stoi[ASSISTANT_TOKEN]}")
-    print(f"  {END_TOKEN:15s} -> {tokenizer.stoi[END_TOKEN]}")
+    for tok in [USER_TOKEN, ASSISTANT_TOKEN, END_TOKEN]:
+        tok_id = tokenizer.encode(tok)
+        print(f"  {tok:15s} -> {tok_id}")
 
     # Show a sample
     sample_text = formatted[0][:200]
     sample_ids = tokenizer.encode(sample_text)
     decoded = tokenizer.decode(sample_ids)
     print(f"\nSample conversation:")
-    print(f"  {sample_text[:150]}...")
+    try:
+        print(f"  {sample_text[:150]}...")
+    except UnicodeEncodeError:
+        print(f"  {sample_text[:150].encode('utf-8', errors='replace')}...")
     print(f"\nRound-trip test: {'PASS' if sample_text == decoded else 'FAIL'}")
 
     source_label = args.source if args.source else "HuggingFace (Alpaca-Armenian)"
