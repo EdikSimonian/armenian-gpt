@@ -393,6 +393,17 @@ Downloaded automatically by `data/download.py`.
 - Covers: history, science, geography, culture, biography, and more
 - Free, no account needed
 
+### Pre-cleaned Dataset (Recommended)
+
+A pre-cleaned, deduplicated Armenian text corpus (~29 GB) is available on HuggingFace. This skips the download and cleaning steps entirely:
+
+```bash
+pip install huggingface_hub
+python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='edisimon/armenian-clean-text', filename='clean_text.txt', repo_type='dataset', local_dir='data/')"
+```
+
+Then go straight to tokenization: `python data/prepare.py --tokenizer bpe`
+
 ### Optional: Additional Data Sources
 
 For better results, you can add more data. After downloading additional data, append it to `data/raw_text.txt` before running `data/prepare.py`.

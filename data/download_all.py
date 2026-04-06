@@ -168,7 +168,7 @@ def _download_hf_worker(args):
     t0 = time.time()
 
     ds = load_dataset(dataset_id, lang_config,
-                      split="train", streaming=True, trust_remote_code=True)
+                      split="train", streaming=True)
 
     chars = 0
     docs = 0
@@ -271,7 +271,7 @@ def main():
         "culturax": ("uonlp/CulturaX", "hy", "text"),
         "oscar": ("oscar-corpus/OSCAR-2301", "hy", "text"),
         "mc4": ("allenai/c4", "hy", "text"),
-        "hplt": ("HPLT/HPLT2.0_cleaned", "hy", "text"),
+        "hplt": ("HPLT/HPLT2.0_cleaned", "hye_Armn", "text"),
         "glot500": ("cis-lmu/Glot500", "hye_Armn", "text"),
     }
 

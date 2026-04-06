@@ -35,8 +35,8 @@ def download():
     print("  Dataset: HPLT/HPLT2.0_cleaned")
     print("  This may take a while (~2-5 GB of text)...")
 
-    ds = load_dataset("HPLT/HPLT2.0_cleaned", "hy",
-                      split="train", trust_remote_code=True)
+    ds = load_dataset("HPLT/HPLT2.0_cleaned", "hye_Armn",
+                      split="train")
 
     print(f"  Downloaded {len(ds):,} documents")
     print(f"  Writing to {HPLT_TXT}...")

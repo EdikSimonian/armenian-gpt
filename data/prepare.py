@@ -50,13 +50,96 @@ def get_file_size(path):
     return os.path.getsize(path) if os.path.exists(path) else 0
 
 
-def clean_file_chunked(input_path, output_path, chunk_bytes=50_000_000):
+def _find_segment_boundaries(path, num_segments):
+    """Find byte offsets that split a file into segments at newline boundaries."""
+    file_size = os.path.getsize(path)
+    boundaries = [0]
+    with open(path, "rb") as f:
+        for i in range(1, num_segments):
+            target = (file_size * i) // num_segments
+            f.seek(target)
+            # Read ahead to find next newline
+            chunk = f.read(8192)
+            nl = chunk.find(b"\n")
+            if nl != -1:
+                boundaries.append(target + nl + 1)
+            else:
+                boundaries.append(target)
+    boundaries.append(file_size)
+    return boundaries
+
+
+def _clean_segment(args):
+    """Clean one segment of the file in small chunks (for multiprocessing)."""
+    input_path, start_byte, end_byte, segment_id = args
+    chunk_size = 50_000_000  # 50 MB at a time
+    out_path = os.path.join(DATA_DIR, f"clean_seg_{segment_id}.txt")
+    out_chars = 0
+    with open(input_path, "rb") as fin, open(out_path, "w", encoding="utf-8") as fout:
+        fin.seek(start_byte)
+        while fin.tell() < end_byte:
+            remaining = end_byte - fin.tell()
+            read_size = min(chunk_size, remaining)
+            raw_bytes = fin.read(read_size)
+            if not raw_bytes:
+                break
+            # If not at end of segment, extend to next newline to avoid mid-line split
+            if fin.tell() < end_byte:
+                extra = fin.read(8192)
+                if extra:
+                    nl = extra.find(b"\n")
+                    if nl != -1:
+                        raw_bytes += extra[:nl + 1]
+                        fin.seek(-(len(extra) - nl - 1), 1)
+                    else:
+                        raw_bytes += extra
+            text = raw_bytes.decode("utf-8", errors="ignore")
+            cleaned = clean_chunk(text)
+            fout.write(cleaned)
+            out_chars += len(cleaned)
+    seg_mb = (end_byte - start_byte) / (1024 * 1024)
+    print(f"  Segment {segment_id}: {seg_mb:.0f} MB -> {out_chars / 1_000_000:.0f}M clean chars")
+    return out_path, out_chars
+
+
+def clean_file_chunked(input_path, output_path, chunk_bytes=50_000_000, parallel=True):
     """
-    Clean the raw text file in chunks, writing cleaned output to a new file.
-    Never loads more than ~50 MB into RAM at a time.
+    Clean the raw text file, writing cleaned output to a new file.
+    If parallel=True, uses multiprocessing to clean segments concurrently.
+    Each worker processes its segment in 50 MB chunks to limit RAM usage.
     """
+    from multiprocessing import Pool, cpu_count
     total_bytes = get_file_size(input_path)
     total_mb = total_bytes / (1024 * 1024)
+
+    if parallel:
+        num_workers = min(cpu_count(), 16)
+        print(f"  Cleaning {total_mb:.0f} MB in parallel with {num_workers} workers...")
+        boundaries = _find_segment_boundaries(input_path, num_workers)
+        args = [
+            (input_path, boundaries[i], boundaries[i + 1], i)
+            for i in range(len(boundaries) - 1)
+        ]
+        with Pool(num_workers) as pool:
+            results = pool.map(_clean_segment, args)
+
+        # Concatenate segment outputs in order
+        out_chars = 0
+        with open(output_path, "w", encoding="utf-8") as fout:
+            for seg_path, seg_chars in results:
+                out_chars += seg_chars
+                with open(seg_path, "r", encoding="utf-8") as fin:
+                    while True:
+                        chunk = fin.read(100_000_000)
+                        if not chunk:
+                            break
+                        fout.write(chunk)
+                os.remove(seg_path)
+
+        print(f"  Cleaned: {out_chars:,} characters")
+        return out_chars
+
+    # Fallback: sequential mode
     processed = 0
     out_chars = 0
 
@@ -147,52 +230,93 @@ def encode_char_chunked(clean_path, tokenizer, output_path, chunk_bytes=50_000_0
     return total_tokens
 
 
-def encode_bpe_chunked(clean_path, tokenizer, output_path, chunk_bytes=10_000_000):
-    """Encode text file with BPE in chunks, appending to output binary file."""
+def _encode_bpe_segment(args):
+    """Encode one segment of clean text with BPE (for multiprocessing)."""
+    clean_path, start_byte, end_byte, segment_id, model_proto_hex = args
+    import sentencepiece as spm
+    sp = spm.SentencePieceProcessor()
+    sp.load_from_serialized_proto(bytes.fromhex(model_proto_hex))
+
+    out_path = os.path.join(DATA_DIR, f"encode_seg_{segment_id}.bin")
+    chunk_size = 10_000_000
     total_tokens = 0
-    total_bytes = get_file_size(clean_path)
 
-    with open(clean_path, "r", encoding="utf-8") as fin, \
-         open(output_path, "wb") as fout:
+    with open(clean_path, "rb") as fin, open(out_path, "wb") as fout:
+        fin.seek(start_byte)
         buffer = ""
-        processed = 0
-        while True:
-            raw = fin.read(chunk_bytes)
-            if not raw:
-                if buffer:
-                    ids = tokenizer.encode(buffer)
-                    np.array(ids, dtype=np.uint16).tofile(fout)
-                    total_tokens += len(ids)
+        while fin.tell() < end_byte:
+            remaining = end_byte - fin.tell()
+            raw_bytes = fin.read(min(chunk_size, remaining))
+            if not raw_bytes:
                 break
-
-            buffer += raw
-            processed += len(raw.encode("utf-8"))
-
-            # Split on paragraph boundary to avoid cutting mid-word
+            # Extend to newline if not at segment end
+            if fin.tell() < end_byte:
+                extra = fin.read(8192)
+                if extra:
+                    nl = extra.find(b"\n")
+                    if nl != -1:
+                        raw_bytes += extra[:nl + 1]
+                        fin.seek(-(len(extra) - nl - 1), 1)
+                    else:
+                        raw_bytes += extra
+            buffer += raw_bytes.decode("utf-8", errors="ignore")
+            # Split on paragraph boundary
             last_para = buffer.rfind("\n\n")
             if last_para != -1:
-                # Split after the full \n\n
                 split_at = last_para + 2
             else:
                 last_nl = buffer.rfind("\n")
                 if last_nl != -1:
                     split_at = last_nl + 1
-                elif len(buffer) > 3 * chunk_bytes:
-                    # Hard cap: force flush to prevent OOM on pathological input
+                elif len(buffer) > 3 * chunk_size:
                     split_at = len(buffer)
                 else:
                     continue
-
             to_encode = buffer[:split_at]
             buffer = buffer[split_at:]
-
-            ids = tokenizer.encode(to_encode)
+            ids = sp.encode(to_encode)
             np.array(ids, dtype=np.uint16).tofile(fout)
             total_tokens += len(ids)
 
-            pct = min(100, processed * 100 / total_bytes) if total_bytes > 0 else 0
-            if int(pct) % 5 == 0:
-                print(f"  Encoding: {pct:.0f}% — {total_tokens:,} tokens so far")
+        if buffer:
+            ids = sp.encode(buffer)
+            np.array(ids, dtype=np.uint16).tofile(fout)
+            total_tokens += len(ids)
+
+    seg_mb = (end_byte - start_byte) / (1024 * 1024)
+    print(f"  Segment {segment_id}: {seg_mb:.0f} MB -> {total_tokens:,} tokens")
+    return out_path, total_tokens
+
+
+def encode_bpe_chunked(clean_path, tokenizer, output_path, chunk_bytes=10_000_000):
+    """Encode text file with BPE, using parallel workers."""
+    from multiprocessing import Pool, cpu_count
+    total_bytes = get_file_size(clean_path)
+    num_workers = min(cpu_count(), 16)
+
+    print(f"  Encoding {total_bytes / 1024 / 1024:.0f} MB with {num_workers} parallel workers...")
+    boundaries = _find_segment_boundaries(clean_path, num_workers)
+    model_proto_hex = tokenizer.sp.serialized_model_proto().hex()
+    args = [
+        (clean_path, boundaries[i], boundaries[i + 1], i, model_proto_hex)
+        for i in range(len(boundaries) - 1)
+    ]
+
+    with Pool(num_workers) as pool:
+        results = pool.map(_encode_bpe_segment, args)
+
+    # Concatenate segment bins in order
+    total_tokens = 0
+    with open(output_path, "wb") as fout:
+        for seg_path, seg_tokens in results:
+            total_tokens += seg_tokens
+            with open(seg_path, "rb") as fin:
+                while True:
+                    chunk = fin.read(100 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    fout.write(chunk)
+            os.remove(seg_path)
 
     return total_tokens
 
@@ -255,8 +379,11 @@ def main():
 
     # Step 2: Clean text in chunks -> clean_text.txt
     clean_path = os.path.join(DATA_DIR, "clean_text.txt")
-    print("Step 1: Cleaning text...")
-    clean_file_chunked(RAW_FILE, clean_path)
+    if os.path.exists(clean_path) and os.path.getmtime(clean_path) > os.path.getmtime(RAW_FILE):
+        print("Step 1: Skipping cleaning (clean_text.txt is up to date)")
+    else:
+        print("Step 1: Cleaning text...")
+        clean_file_chunked(RAW_FILE, clean_path)
 
     # Step 3: Build tokenizer
     print("\nStep 2: Building tokenizer...")

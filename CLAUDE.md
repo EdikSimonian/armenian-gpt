@@ -32,7 +32,12 @@ python data/download_all.py
 Sources (downloaded in order): Wikipedia, CC-100, CulturaX, OSCAR, mC4, HPLT, Glot500.
 Skip sources with: `python data/download_all.py --skip wiki cc100`
 
-Then tokenize (memory-safe, processes in chunks):
+Pre-cleaned dataset available on HuggingFace (private, ~29 GB):
+```bash
+python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='edisimon/armenian-clean-text', filename='clean_text.txt', repo_type='dataset', local_dir='data/')"
+```
+
+Then tokenize (memory-safe, processes in chunks, parallel with 16 workers):
 ```bash
 python data/prepare.py --tokenizer bpe
 ```

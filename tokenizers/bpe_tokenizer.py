@@ -32,7 +32,7 @@ class BPETokenizer:
         base = self.sp.get_piece_size() if self.sp is not None else self._vocab_size
         return base + len(self._special_token_to_id)
 
-    def train(self, text_file, model_prefix="data/bpe_model", vocab_size=8000):
+    def train(self, text_file, model_prefix="data/bpe_model", vocab_size=16000):
         """
         Train a BPE model on Armenian text.
 
@@ -59,6 +59,7 @@ class BPETokenizer:
             pad_id=3,
             input_sentence_size=1_000_000,  # sample 1M sentences for large files
             shuffle_input_sentence=True,
+            num_threads=16,
         )
         self.sp = spm.SentencePieceProcessor(model_file=f"{model_prefix}.model")
         print(f"BPE tokenizer trained! Vocab size: {self.vocab_size}")
