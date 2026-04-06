@@ -100,12 +100,12 @@ python data/prepare.py --tokenizer bpe
 # Free raw text after tokenizing (~20-40 GB saved)
 rm -f data/raw_text.txt data/clean_text.txt
 
-# Train (A40-optimized: batch 16, accum 8 = effective 128)
+# Train (A6000-optimized: batch 32, accum 4 = effective 128, tf32 + torch.compile auto-enabled)
 tmux new -s train
-python train.py --preset xlarge --tokenizer bpe --batch_size 16 --grad_accum_steps 8
+python train.py --preset xlarge --tokenizer bpe
 
 # Resume if interrupted
-python train.py --preset xlarge --tokenizer bpe --batch_size 16 --grad_accum_steps 8 --resume_from checkpoints/step_XXXXX.pt
+python train.py --preset xlarge --tokenizer bpe --resume_from checkpoints/step_XXXXX.pt
 ```
 
 Estimated training time on A40: ~22 hours at $0.40/hr (Secure Cloud) = ~$8.80 total.

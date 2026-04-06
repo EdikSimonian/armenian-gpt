@@ -57,13 +57,13 @@ PRESETS = {
         n_head=16,
         n_embd=1024,
         block_size=1024,
-        batch_size=8,
-        grad_accum_steps=16,  # effective batch = 8*16 = 128
-        max_iters=100000,
+        batch_size=24,
+        grad_accum_steps=6,  # effective batch = 24*6 = 144
+        max_iters=36000,
         learning_rate=3e-4,
         warmup_iters=2000,
         eval_interval=2000,
-        save_interval=5000,
+        save_interval=2000,
         sample_interval=2000,
     ),
     # Stage 2: fine-tuning on conversational data
@@ -144,6 +144,8 @@ def get_config():
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--data_dir", type=str, default=None)
     parser.add_argument("--resume_from", type=str, default=None)
+    parser.add_argument("--hf_repo", type=str, default=None,
+                        help="HuggingFace repo to upload checkpoints (e.g. edisimon/armgpt)")
 
     args = parser.parse_args()
 

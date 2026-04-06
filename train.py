@@ -22,6 +22,12 @@ import sys
 # Force unbuffered output so logs appear immediately when piped
 os.environ["PYTHONUNBUFFERED"] = "1"
 
+import builtins
+_original_print = builtins.print
+def print(*args, **kwargs):
+    kwargs.setdefault("flush", True)
+    _original_print(*args, **kwargs)
+
 import time
 import json
 import math
@@ -117,6 +123,12 @@ def main():
     device = cfg["device"]
     use_amp = device == "cuda"
 
+    # Enable tf32 for Ampere+ GPUs (A6000, A100, RTX 30xx/40xx) — ~2x faster matmuls
+    if device == "cuda":
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     # Print configuration
     print(f"\n{'='*50}")
     print(f"  ArmGPT Training")
@@ -146,6 +158,11 @@ def main():
         block_size=cfg["block_size"],
         dropout=cfg["dropout"],
     ).to(device)
+
+    # Compile model for faster training (PyTorch 2.0+)
+    if device == "cuda" and hasattr(torch, "compile"):
+        print("Compiling model with torch.compile()...")
+        model = torch.compile(model)
 
     # Create optimizer
     optimizer = torch.optim.AdamW(
@@ -288,7 +305,7 @@ def main():
             t0 = time.time()
             running_loss = 0.0
 
-        # Save checkpoint
+        # Save checkpoint and upload to HF
         if step > 0 and step % cfg["save_interval"] == 0:
             ckpt_path = os.path.join(cfg["checkpoint_dir"], f"step_{step}.pt")
             torch.save({
@@ -298,6 +315,23 @@ def main():
                 "config": cfg,
             }, ckpt_path)
             print(f"Checkpoint saved: {ckpt_path}")
+            # Upload checkpoint to HF in background
+            if cfg.get("hf_repo"):
+                import threading
+                def _upload_ckpt(path, repo, step_num):
+                    try:
+                        from huggingface_hub import HfApi
+                        api = HfApi()
+                        api.upload_file(
+                            path_or_fileobj=path,
+                            path_in_repo=f"checkpoints/step_{step_num}.pt",
+                            repo_id=repo,
+                            repo_type="model",
+                        )
+                        print(f"  Uploaded {path} to HF")
+                    except Exception as e:
+                        print(f"  HF upload failed: {e}")
+                threading.Thread(target=_upload_ckpt, args=(ckpt_path, cfg["hf_repo"], step), daemon=True).start()
 
     # Save final checkpoint
     final_path = os.path.join(cfg["checkpoint_dir"], "final.pt")
@@ -307,6 +341,21 @@ def main():
         "step": cfg["max_iters"],
         "config": cfg,
     }, final_path)
+
+    # Upload final checkpoint to HF
+    if cfg.get("hf_repo"):
+        try:
+            from huggingface_hub import HfApi
+            api = HfApi()
+            api.upload_file(
+                path_or_fileobj=final_path,
+                path_in_repo="checkpoints/final.pt",
+                repo_id=cfg["hf_repo"],
+                repo_type="model",
+            )
+            print(f"  Final checkpoint uploaded to HF: {cfg['hf_repo']}")
+        except Exception as e:
+            print(f"  HF upload failed: {e}")
 
     # Final evaluation
     losses = estimate_loss(model, train_data, val_data, cfg)
