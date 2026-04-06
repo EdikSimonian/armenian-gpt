@@ -5,5 +5,5 @@ mwxml>=0.3
 requests>=2.28
 # Stage 2: for downloading Alpaca-Armenian chat data
 datasets>=2.14
-# Level 2 (BPE tokenizer) - optional, uncomment if needed
-# sentencepiece>=0.1.99
+# Level 2 (BPE tokenizer)
+sentencepiece>=0.1.99

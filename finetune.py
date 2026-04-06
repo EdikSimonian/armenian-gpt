@@ -174,8 +174,12 @@ def main():
     model.load_state_dict(model_state)
     print(f"  Loaded Stage 1 weights (vocab: {old_vocab_size} -> {new_vocab_size})")
 
-    # Save vocab_size in config for later use
+    # Use Stage 1 model architecture in config so chat.py can rebuild the model
     cfg["vocab_size"] = new_vocab_size
+    cfg["n_layer"] = stage1_cfg["n_layer"]
+    cfg["n_head"] = stage1_cfg["n_head"]
+    cfg["n_embd"] = stage1_cfg["n_embd"]
+    cfg["block_size"] = stage1_cfg["block_size"]
 
     # Create optimizer (fresh — don't reuse Stage 1 optimizer state)
     optimizer = torch.optim.AdamW(
@@ -250,7 +254,8 @@ def main():
             prompt_ids = tokenizer.encode(sample_prompt)
             if prompt_ids:
                 context = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-                end_token_id = tokenizer.stoi.get("<|end|>")
+                end_ids = tokenizer.encode("<|end|>")
+                end_token_id = end_ids[0] if end_ids else None
                 stop = {end_token_id} if end_token_id is not None else None
                 generated = model.generate(context, max_new_tokens=200,
                                            temperature=0.7, top_k=40,

@@ -1,21 +1,11 @@
 """
-ArmGPT Model - A simple GPT (Generative Pre-trained Transformer)
+ArmGPT Model - A modern GPT with RMSNorm, SwiGLU, and RoPE.
 
-This is the brain of ArmGPT. It learns to predict the next character/token
-in Armenian text. The architecture is the same as GPT-2, just smaller.
-
-Key idea: The model reads a sequence of tokens and predicts what comes next.
-           During training, it gets better at this prediction over time.
-
-Architecture (each piece builds on the last):
+Architecture:
     1. Token Embedding:   convert token IDs to vectors
-    2. Position Embedding: tell the model where each token is in the sequence
-    3. Transformer Blocks: the model "thinks" by letting tokens talk to each other
+    2. RoPE:              rotary position embeddings (no learned position table)
+    3. Transformer Blocks: RMSNorm + Attention + SwiGLU MLP
     4. Output Head:        predict the next token
-
-A Transformer Block has two parts:
-    - Self-Attention: each token looks at previous tokens to gather context
-    - MLP (Feed-Forward): each token processes its gathered information
 """
 
 import math
@@ -24,129 +14,139 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class RMSNorm(nn.Module):
+    """Root Mean Square Layer Normalization — faster than LayerNorm, no bias."""
+
+    def __init__(self, dim, eps=1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x):
+        rms = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x.float() * rms).type_as(x) * self.weight
+
+
+def precompute_rope(dim, max_seq_len, theta=10000.0):
+    """Precompute rotary position embedding frequencies."""
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
+    t = torch.arange(max_seq_len).float()
+    freqs = torch.outer(t, freqs)
+    cos = freqs.cos()
+    sin = freqs.sin()
+    return cos, sin
+
+
+def apply_rope(x, cos, sin):
+    """Apply rotary position embeddings to query/key tensors."""
+    B, n_head, T, head_dim = x.shape
+    cos = cos[:T].unsqueeze(0).unsqueeze(0)  # (1, 1, T, head_dim//2)
+    sin = sin[:T].unsqueeze(0).unsqueeze(0)
+    # Split into pairs and rotate
+    x1 = x[..., :head_dim // 2]
+    x2 = x[..., head_dim // 2:]
+    return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+
+
 class CausalSelfAttention(nn.Module):
-    """Each token attends to (looks at) all previous tokens to gather context."""
+    """Self-attention with RoPE (no causal mask buffer needed — using F.scaled_dot_product_attention)."""
 
     def __init__(self, n_embd, n_head, block_size, dropout):
         super().__init__()
-        assert n_embd % n_head == 0, "n_embd must be divisible by n_head"
-        # Key, Query, Value projections — all in one matrix for efficiency
-        self.c_attn = nn.Linear(n_embd, 3 * n_embd)
-        # Output projection
-        self.c_proj = nn.Linear(n_embd, n_embd)
+        assert n_embd % n_head == 0
+        self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
+        self.c_proj = nn.Linear(n_embd, n_embd, bias=False)
         self.n_head = n_head
         self.n_embd = n_embd
+        self.head_dim = n_embd // n_head
         self.dropout = dropout
-        # Causal mask: tokens can only look at previous positions, not future ones
-        self.register_buffer("bias", torch.tril(torch.ones(block_size, block_size))
-                             .view(1, 1, block_size, block_size))
+        # Precompute RoPE
+        cos, sin = precompute_rope(self.head_dim, block_size)
+        self.register_buffer("rope_cos", cos)
+        self.register_buffer("rope_sin", sin)
 
     def forward(self, x):
-        B, T, C = x.size()  # batch, sequence length, embedding dim
-
-        # Calculate Query, Key, Value for all heads at once
+        B, T, C = x.size()
         qkv = self.c_attn(x)
         q, k, v = qkv.split(self.n_embd, dim=2)
 
-        # Reshape into multiple heads: (B, T, C) -> (B, n_head, T, head_dim)
-        head_dim = C // self.n_head
-        q = q.view(B, T, self.n_head, head_dim).transpose(1, 2)
-        k = k.view(B, T, self.n_head, head_dim).transpose(1, 2)
-        v = v.view(B, T, self.n_head, head_dim).transpose(1, 2)
+        q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
 
-        # Attention: how much should each token pay attention to each other token?
-        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(head_dim))
-        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))
-        att = F.softmax(att, dim=-1)
-        att = F.dropout(att, p=self.dropout, training=self.training)
+        # Apply RoPE to queries and keys
+        q = apply_rope(q, self.rope_cos, self.rope_sin)
+        k = apply_rope(k, self.rope_cos, self.rope_sin)
 
-        # Gather information from the tokens we're attending to
-        y = att @ v
-        # Recombine heads: (B, n_head, T, head_dim) -> (B, T, C)
+        # Use PyTorch's efficient attention (handles causal mask internally)
+        y = F.scaled_dot_product_attention(
+            q, k, v,
+            is_causal=True,
+            dropout_p=self.dropout if self.training else 0.0,
+        )
+
         y = y.transpose(1, 2).contiguous().view(B, T, C)
-
-        # Final projection
         y = self.c_proj(y)
         return y
 
 
-class MLP(nn.Module):
-    """A simple feed-forward network: each token processes its information."""
+class SwiGLUMLP(nn.Module):
+    """SwiGLU feed-forward network — better than GELU, used by LLaMA/Mistral."""
 
     def __init__(self, n_embd, dropout):
         super().__init__()
-        self.c_fc = nn.Linear(n_embd, 4 * n_embd)   # expand
-        self.gelu = nn.GELU()                         # activation function
-        self.c_proj = nn.Linear(4 * n_embd, n_embd)  # project back
+        # SwiGLU uses 8/3 * n_embd hidden dim (rounded to multiple of 64 for efficiency)
+        hidden = int(8 / 3 * n_embd)
+        hidden = ((hidden + 63) // 64) * 64  # round up to multiple of 64
+        self.w1 = nn.Linear(n_embd, hidden, bias=False)  # gate
+        self.w2 = nn.Linear(hidden, n_embd, bias=False)   # down
+        self.w3 = nn.Linear(n_embd, hidden, bias=False)  # up
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
+        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 
 class Block(nn.Module):
-    """One Transformer block: self-attention followed by MLP, with residual connections."""
+    """Transformer block: RMSNorm + Attention + SwiGLU MLP."""
 
     def __init__(self, n_embd, n_head, block_size, dropout):
         super().__init__()
-        self.ln_1 = nn.LayerNorm(n_embd)  # normalize before attention
+        self.ln_1 = RMSNorm(n_embd)
         self.attn = CausalSelfAttention(n_embd, n_head, block_size, dropout)
-        self.ln_2 = nn.LayerNorm(n_embd)  # normalize before MLP
-        self.mlp = MLP(n_embd, dropout)
+        self.ln_2 = RMSNorm(n_embd)
+        self.mlp = SwiGLUMLP(n_embd, dropout)
 
     def forward(self, x):
-        # Residual connection: add the output back to the input
-        # This helps the model train by letting gradients flow easily
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
 
 
 class GPT(nn.Module):
-    """
-    The full GPT language model.
-
-    Takes a sequence of token IDs and predicts the next token at each position.
-    """
+    """GPT language model with RMSNorm, RoPE, and SwiGLU."""
 
     def __init__(self, vocab_size, n_layer, n_head, n_embd, block_size, dropout):
         super().__init__()
         self.block_size = block_size
 
         self.transformer = nn.ModuleDict(dict(
-            # Token embedding: token ID -> vector
             wte=nn.Embedding(vocab_size, n_embd),
-            # Position embedding: position -> vector
-            wpe=nn.Embedding(block_size, n_embd),
-            # Dropout on embeddings
             drop=nn.Dropout(dropout),
-            # Stack of transformer blocks
             blocks=nn.ModuleList([
                 Block(n_embd, n_head, block_size, dropout)
                 for _ in range(n_layer)
             ]),
-            # Final layer normalization
-            ln_f=nn.LayerNorm(n_embd),
+            ln_f=RMSNorm(n_embd),
         ))
-        # Output head: vector -> vocabulary logits (one score per possible next token)
         self.lm_head = nn.Linear(n_embd, vocab_size, bias=False)
-
-        # Weight tying: share weights between token embedding and output head
-        # This is a common trick that improves quality and reduces parameters
         self.transformer.wte.weight = self.lm_head.weight
 
-        # Initialize weights
         self.apply(self._init_weights)
-        # Print parameter count
         n_params = sum(p.numel() for p in self.parameters())
         print(f"GPT model initialized: {n_params:,} parameters")
 
     def _init_weights(self, module):
-        """Initialize weights using small random values."""
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -155,39 +155,18 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
-        """
-        Forward pass: predict next tokens.
-
-        Args:
-            idx: input token IDs, shape (batch_size, sequence_length)
-            targets: target token IDs for computing loss (optional)
-
-        Returns:
-            logits: prediction scores for each position, shape (B, T, vocab_size)
-            loss: cross-entropy loss (only if targets are provided)
-        """
         B, T = idx.size()
         assert T <= self.block_size, f"Sequence length {T} exceeds block_size {self.block_size}"
 
-        # Create position indices: [0, 1, 2, ..., T-1]
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
+        # Token embeddings only — RoPE handles positions inside attention
+        x = self.transformer.drop(self.transformer.wte(idx))
 
-        # Combine token and position embeddings
-        tok_emb = self.transformer.wte(idx)   # (B, T, n_embd)
-        pos_emb = self.transformer.wpe(pos)   # (T, n_embd)
-        x = self.transformer.drop(tok_emb + pos_emb)
-
-        # Pass through all transformer blocks
         for block in self.transformer.blocks:
             x = block(x)
 
-        # Final normalization
         x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
 
-        # Predict next token
-        logits = self.lm_head(x)  # (B, T, vocab_size)
-
-        # Calculate loss if we have targets
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
@@ -197,43 +176,16 @@ class GPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None,
                  stop_tokens=None):
-        """
-        Generate new tokens one at a time.
-
-        Args:
-            idx: starting token IDs, shape (1, T)
-            max_new_tokens: how many new tokens to generate
-            temperature: controls randomness (0.1 = safe, 1.0 = creative, 2.0 = wild)
-            top_k: only sample from the top k most likely tokens (None = all)
-            stop_tokens: set of token IDs that end generation early (e.g. end-of-turn)
-
-        Returns:
-            idx: the full sequence including generated tokens
-        """
         for _ in range(max_new_tokens):
-            # Crop to the last block_size tokens (the model's context window)
             idx_cond = idx[:, -self.block_size:]
-
-            # Get predictions
             logits, _ = self(idx_cond)
-
-            # Take only the last position's predictions
             logits = logits[:, -1, :] / temperature
-
-            # Optionally only keep the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float("-inf")
-
-            # Convert to probabilities and sample
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
-
-            # Append the new token to the sequence
             idx = torch.cat((idx, idx_next), dim=1)
-
-            # Stop early if we hit a stop token (e.g. end-of-turn in chat mode)
             if stop_tokens and idx_next.item() in stop_tokens:
                 break
-
         return idx
