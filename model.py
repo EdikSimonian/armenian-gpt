@@ -175,11 +175,33 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None,
-                 stop_tokens=None):
+                 stop_tokens=None, repetition_penalty=1.0):
+        """Generate tokens autoregressively.
+
+        Args:
+            repetition_penalty: 1.0 = no penalty (off). >1.0 discourages
+                repeating tokens already in the context (CTRL-style penalty).
+                Typical values: 1.1–1.3. Helps small LMs escape repetition loops.
+        """
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.block_size:]
             logits, _ = self(idx_cond)
-            logits = logits[:, -1, :] / temperature
+            logits = logits[:, -1, :]
+
+            # CTRL-style repetition penalty: scale logits for tokens already seen.
+            # Positive logits get divided (made smaller); negative logits get
+            # multiplied (made more negative). Applied before temperature.
+            if repetition_penalty != 1.0:
+                seen = torch.unique(idx_cond)
+                seen_logits = logits[:, seen]
+                seen_logits = torch.where(
+                    seen_logits > 0,
+                    seen_logits / repetition_penalty,
+                    seen_logits * repetition_penalty,
+                )
+                logits[:, seen] = seen_logits
+
+            logits = logits / temperature
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float("-inf")
