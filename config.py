@@ -63,7 +63,7 @@ PRESETS = {
         learning_rate=3e-4,
         warmup_iters=2000,
         eval_interval=2000,
-        save_interval=2000,
+        save_interval=1000,  # snapshot every 1000 steps for tighter HF upload cadence
         sample_interval=2000,
     ),
     # Stage 2: fine-tuning on conversational data

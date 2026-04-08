@@ -44,6 +44,9 @@ def main():
                         help="Randomness: 0.1=safe, 0.8=balanced, 1.5=creative")
     parser.add_argument("--top_k", type=int, default=20,
                         help="Only sample from top k tokens (0=all)")
+    parser.add_argument("--repetition_penalty", type=float, default=1.15,
+                        help="Penalty for repeating tokens already in context. "
+                             "1.0=off, 1.1-1.3 typical, helps escape repetition loops")
     parser.add_argument("--num_samples", type=int, default=1,
                         help="How many samples to generate")
     parser.add_argument("--data_dir", type=str, default="data",
@@ -103,7 +106,8 @@ def main():
     for i in range(args.num_samples):
         context = torch.tensor([prompt_ids], dtype=torch.long, device=device)
         output = model.generate(context, max_new_tokens=args.length,
-                                temperature=args.temperature, top_k=top_k)
+                                temperature=args.temperature, top_k=top_k,
+                                repetition_penalty=args.repetition_penalty)
         text = tokenizer.decode(output[0].tolist())
 
         if args.num_samples > 1:
