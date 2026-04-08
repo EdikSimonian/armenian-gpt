@@ -38,11 +38,11 @@ def main():
                         help="Path to model checkpoint")
     parser.add_argument("--prompt", type=str, default="Հայաստան",
                         help="Starting text (Armenian)")
-    parser.add_argument("--length", type=int, default=300,
+    parser.add_argument("--length", type=int, default=200,
                         help="Number of tokens/characters to generate")
-    parser.add_argument("--temperature", type=float, default=0.8,
+    parser.add_argument("--temperature", type=float, default=0.6,
                         help="Randomness: 0.1=safe, 0.8=balanced, 1.5=creative")
-    parser.add_argument("--top_k", type=int, default=40,
+    parser.add_argument("--top_k", type=int, default=20,
                         help="Only sample from top k tokens (0=all)")
     parser.add_argument("--num_samples", type=int, default=1,
                         help="How many samples to generate")
@@ -80,7 +80,11 @@ def main():
         block_size=cfg["block_size"],
         dropout=0.0,  # no dropout during generation
     ).to(device)
-    model.load_state_dict(checkpoint["model"])
+    state_dict = checkpoint["model"]
+    # Strip torch.compile() prefix if present
+    if any(k.startswith("_orig_mod.") for k in state_dict):
+        state_dict = {k.removeprefix("_orig_mod."): v for k, v in state_dict.items()}
+    model.load_state_dict(state_dict)
     model.eval()
 
     # Encode the prompt
