@@ -132,8 +132,8 @@ Trained on Armenian text from multiple sources:
 ```python
 import torch
 import json
-from model import GPT
-from tokenizers.bpe_tokenizer import BPETokenizer
+from core.model import GPT
+from core.bpe_tokenizer import BPETokenizer
 
 # Load model
 checkpoint = torch.load("model.pt", map_location="cpu")
@@ -256,7 +256,7 @@ def main():
         print(f"Error: checkpoint not found: {args.checkpoint}")
         return
 
-    from tokenizers import (
+    from core import (
         detect_tokenizer_type,
         tokenizer_path as _tokenizer_path,
     )
@@ -297,12 +297,14 @@ def main():
 
     # Copy source files so users can run the model. The pipeline uses numeric
     # prefixes at repo root, but the HF bundle is a standalone artifact — drop
-    # the prefix there so consumers see a plain `generate.py` etc.
+    # the `5_` prefix on generate.py. The `core/` subpackage ships intact so
+    # the bundled generate.py's `from core.model import GPT` still resolves.
     source_map = {
-        "model.py": "model.py",
+        "core/__init__.py": "core/__init__.py",
+        "core/model.py": "core/model.py",
+        "core/char_tokenizer.py": "core/char_tokenizer.py",
+        "core/bpe_tokenizer.py": "core/bpe_tokenizer.py",
         "5_generate.py": "generate.py",
-        "tokenizers/char_tokenizer.py": "tokenizers/char_tokenizer.py",
-        "tokenizers/bpe_tokenizer.py": "tokenizers/bpe_tokenizer.py",
     }
     for src_file, dest_name in source_map.items():
         src_path = os.path.join(os.path.dirname(__file__), src_file)

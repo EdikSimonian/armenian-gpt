@@ -35,8 +35,8 @@ import threading
 import numpy as np
 import torch
 
-from model import GPT
-from config import get_config
+from core.model import GPT
+from core.config import get_config
 
 
 # --- HF async upload helpers --------------------------------------------------
@@ -131,7 +131,7 @@ def save_and_upload_chat_checkpoint(model, optimizer, step, cfg, local_name,
 
     # First upload also ships the chat tokenizer (once per run).
     if not _HF_CHAT_TOKENIZER_UPLOADED:
-        from tokenizers import tokenizer_path as _tok_path
+        from core import tokenizer_path as _tok_path
         chat_tok_path = _tok_path("data_chat", cfg["tokenizer"])
         if os.path.exists(chat_tok_path):
             _hf_upload_bg(
@@ -150,7 +150,7 @@ def save_and_upload_chat_checkpoint(model, optimizer, step, cfg, local_name,
 
 def load_data(data_dir, tokenizer_type):
     """Load the chat training and validation data for the given tokenizer."""
-    from tokenizers import bin_paths
+    from core import bin_paths
     train_path, val_path = bin_paths(data_dir, tokenizer_type)
 
     if not os.path.exists(train_path):
@@ -165,7 +165,7 @@ def load_data(data_dir, tokenizer_type):
 
 def load_tokenizer(data_dir, tokenizer_type):
     """Load the extended tokenizer with special chat tokens."""
-    from tokenizers import load_tokenizer as _load, tokenizer_path
+    from core import load_tokenizer as _load, tokenizer_path
     tok_path = tokenizer_path(data_dir, tokenizer_type)
     if not os.path.exists(tok_path):
         print(f"Error: {tok_path} not found! "

@@ -1,4 +1,16 @@
-"""Tokenizer package helpers.
+"""Shared runtime modules imported by the numbered pipeline steps.
+
+Contents:
+    core.model            — GPT architecture (RMSNorm, RoPE, SwiGLU)
+    core.config           — training presets and argparse-backed get_config()
+    core.char_tokenizer   — character-level tokenizer
+    core.bpe_tokenizer    — SentencePiece BPE tokenizer
+
+And the path/resolver helpers re-exported here at package level:
+    tokenizer_path(data_dir, type)        → data_dir/tokenizer_{type}.json
+    bin_paths(data_dir, type)             → (train_{type}.bin, val_{type}.bin)
+    detect_tokenizer_type(data_dir)       → "char" or "bpe"
+    load_tokenizer(data_dir, type)        → instantiated tokenizer
 
 Both the char and BPE pipelines write their artifacts side-by-side using a
 tokenizer-type suffix:
@@ -7,8 +19,7 @@ tokenizer-type suffix:
     data/val_char.bin        data/val_bpe.bin
     data/tokenizer_char.json data/tokenizer_bpe.json
 
-The helpers here centralize path resolution and loading so callers never need
-to hand-build these filenames.
+The helpers centralize path resolution so callers never hand-build filenames.
 """
 
 import os
@@ -52,9 +63,9 @@ def load_tokenizer(data_dir, tokenizer_type):
     """Instantiate and load the right tokenizer class for the given type."""
     path = tokenizer_path(data_dir, tokenizer_type)
     if tokenizer_type == "char":
-        from tokenizers.char_tokenizer import CharTokenizer
+        from .char_tokenizer import CharTokenizer
         return CharTokenizer.load(path)
     if tokenizer_type == "bpe":
-        from tokenizers.bpe_tokenizer import BPETokenizer
+        from .bpe_tokenizer import BPETokenizer
         return BPETokenizer.load(path)
     raise ValueError(f"Unknown tokenizer type: {tokenizer_type!r}")

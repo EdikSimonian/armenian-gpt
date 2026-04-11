@@ -17,8 +17,8 @@ import os
 import sys
 import torch
 
-from model import GPT
-from tokenizers import detect_tokenizer_type, load_tokenizer as _load_tokenizer
+from core.model import GPT
+from core import detect_tokenizer_type, load_tokenizer as _load_tokenizer
 
 
 def load_tokenizer(data_dir, tokenizer_type=None):

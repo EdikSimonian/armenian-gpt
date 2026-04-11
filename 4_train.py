@@ -35,13 +35,13 @@ import math
 import numpy as np
 import torch
 
-from model import GPT
-from config import get_config
+from core.model import GPT
+from core.config import get_config
 
 
 def load_data(data_dir, tokenizer_type, device):
     """Load pre-encoded training and validation data for the given tokenizer."""
-    from tokenizers import bin_paths
+    from core import bin_paths
     train_path, val_path = bin_paths(data_dir, tokenizer_type)
 
     if not os.path.exists(train_path):
@@ -60,7 +60,7 @@ def load_data(data_dir, tokenizer_type, device):
 
 def load_tokenizer(data_dir, tokenizer_type):
     """Load the tokenizer that was used during data preparation."""
-    from tokenizers import load_tokenizer as _load, tokenizer_path
+    from core import load_tokenizer as _load, tokenizer_path
     path = tokenizer_path(data_dir, tokenizer_type)
     if not os.path.exists(path):
         print(f"Error: {path} not found! "

@@ -62,7 +62,7 @@ def _find_segment_boundaries(path, num_segments):
 
 def build_char_vocab(clean_path, chunk_bytes=50_000_000):
     """Scan the clean file to build character vocabulary without loading it all."""
-    from tokenizers.char_tokenizer import CharTokenizer
+    from core.char_tokenizer import CharTokenizer
     tokenizer = CharTokenizer()
     chars = set()
 
@@ -246,7 +246,7 @@ def tokenize_corpus(tokenizer_type):
         print("\nStep 3b: Encoding text...")
         total_tokens = encode_char_chunked(CLEAN_FILE, tokenizer, all_tokens_path)
     else:
-        from tokenizers.bpe_tokenizer import BPETokenizer
+        from core.bpe_tokenizer import BPETokenizer
         tokenizer = BPETokenizer()
         tokenizer.train(CLEAN_FILE, model_prefix=os.path.join(DATA_DIR, "bpe_model"))
         print(f"  Vocabulary: {tokenizer.vocab_size} tokens")
@@ -257,7 +257,7 @@ def tokenize_corpus(tokenizer_type):
     print(f"  Total tokens: {total_tokens:,}")
 
     print("\nStep 3c: Splitting train/val (90/10)...")
-    from tokenizers import bin_paths, tokenizer_path
+    from core import bin_paths, tokenizer_path
     train_path, val_path = bin_paths(DATA_DIR, tokenizer_type)
     split_bin_file(all_tokens_path, train_path, val_path)
 

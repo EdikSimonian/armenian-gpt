@@ -93,7 +93,7 @@ def prepare_chat_data(source_path, tokenizer_type):
     source_path: path to a {instruction, input?, output} JSON file.
     tokenizer_type: "char" or "bpe" — must match what was used in 3_tokenize.py.
     """
-    from tokenizers import (
+    from core import (
         bin_paths,
         load_tokenizer as _load_tokenizer,
         tokenizer_path,
@@ -182,7 +182,7 @@ def main():
                         help="Stage 1 tokenizer type. If omitted, auto-detects from data/.")
     args = parser.parse_args()
 
-    from tokenizers import detect_tokenizer_type
+    from core import detect_tokenizer_type
 
     if args.tokenizer:
         tok_type = args.tokenizer
