@@ -24,10 +24,11 @@ import json
 import argparse
 import numpy as np
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
 
-DATA_DIR = os.path.dirname(os.path.abspath(__file__))
-CHAT_DIR = os.path.join(os.path.dirname(DATA_DIR), "data_chat")
+DATA_DIR = os.path.join(_REPO_ROOT, "data")
+CHAT_DIR = os.path.join(_REPO_ROOT, "data_chat")
 
 # Special tokens for chat formatting
 USER_TOKEN = "<|user|>"

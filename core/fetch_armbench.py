@@ -34,7 +34,8 @@ import sys
 from datasets import load_dataset
 
 
-DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(_REPO_ROOT, "data")
 
 TRAIN_CONFIGS = [
     "exam_history",

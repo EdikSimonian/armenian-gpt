@@ -491,9 +491,8 @@ def download_corpus(args):
 
 def download_qa(args):
     """Fetch all SFT source JSONs into data/ for later merging + tokenizing."""
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from data.fetch_armbench import fetch_armbench_qa
-    from data.fetch_aya_armenian import fetch_aya_qa
+    from core.fetch_armbench import fetch_armbench_qa
+    from core.fetch_aya_armenian import fetch_aya_qa
 
     skip = set(s.lower() for s in args.skip)
 

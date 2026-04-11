@@ -278,7 +278,7 @@ def tokenize_corpus(tokenizer_type):
 
 def tokenize_qa(tokenizer_type):
     """Tokenize the merged SFT JSON into data_chat/*.bin for fine-tuning."""
-    from data.prepare_chat import prepare_chat_data
+    from core.prepare_chat import prepare_chat_data
 
     source_path = os.path.join(DATA_DIR, "qa_merged.json")
     if not os.path.exists(source_path):

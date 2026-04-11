@@ -160,8 +160,7 @@ def prepare_corpus():
 
 def prepare_qa():
     """Merge the SFT source JSONs into data/qa_merged.json."""
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-    from data.merge_sft_sources import merge_sft_sources
+    from core.merge_sft_sources import merge_sft_sources
 
     # Inputs in priority order — earlier sources win dedup ties.
     # armenian_qa.json is only present if the user ran the optional Claude
