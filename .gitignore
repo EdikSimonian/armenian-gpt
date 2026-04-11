@@ -17,7 +17,7 @@ stop_monitor.log
 finetune*.log
 
 # HF Space clone (separate git repo, serves fine-tuned model)
-hf-space/
+core/hf-space/
 
 # Checkpoints
 checkpoints/
