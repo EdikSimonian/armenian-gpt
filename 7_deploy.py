@@ -295,12 +295,19 @@ def main():
         chat_included = True
         print("  Chat model added.")
 
-    # Copy source files so users can run the model
-    for src_file in ["model.py", "5_generate.py",
-                     "tokenizers/char_tokenizer.py", "tokenizers/bpe_tokenizer.py"]:
+    # Copy source files so users can run the model. The pipeline uses numeric
+    # prefixes at repo root, but the HF bundle is a standalone artifact — drop
+    # the prefix there so consumers see a plain `generate.py` etc.
+    source_map = {
+        "model.py": "model.py",
+        "5_generate.py": "generate.py",
+        "tokenizers/char_tokenizer.py": "tokenizers/char_tokenizer.py",
+        "tokenizers/bpe_tokenizer.py": "tokenizers/bpe_tokenizer.py",
+    }
+    for src_file, dest_name in source_map.items():
         src_path = os.path.join(os.path.dirname(__file__), src_file)
         if os.path.exists(src_path):
-            dest = os.path.join(output_dir, src_file)
+            dest = os.path.join(output_dir, dest_name)
             os.makedirs(os.path.dirname(dest), exist_ok=True)
             shutil.copy2(src_path, dest)
 
