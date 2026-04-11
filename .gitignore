@@ -4,6 +4,7 @@ data/*.txt
 data/*.bz2
 data/*.model
 data/*.vocab
+data/*.json
 data/tokenizer.json
 data/tokenizer_char.json
 data/.*_done
@@ -16,6 +17,10 @@ pipeline_log.txt
 train.log
 watchdog.log
 stop_monitor.log
+finetune*.log
+
+# HF Space clone (separate git repo, serves fine-tuned model)
+hf-space/
 
 # Checkpoints
 checkpoints/
