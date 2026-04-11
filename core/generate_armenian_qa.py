@@ -51,7 +51,8 @@ TOPICS = [
 PAIRS_PER_TOPIC = 200      # 25 × 200 = 5,000 total
 BATCH_SIZE = 20            # Q&A pairs per API call
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-OUTPUT_FILE = os.path.join(_REPO_ROOT, "data", "armenian_qa.json")
+OUTPUT_FILE = os.path.join(_REPO_ROOT, "data", "text", "finetune", "armenian_qa.json")
+os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
 PROGRESS_FILE = OUTPUT_FILE.replace(".json", "_progress.json")
 
 

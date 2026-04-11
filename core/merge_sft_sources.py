@@ -22,6 +22,7 @@ import sys
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(_REPO_ROOT, "data")
+TEXT_FINETUNE_DIR = os.path.join(DATA_DIR, "text", "finetune")
 _WHITESPACE_RE = re.compile(r"\s+")
 
 
@@ -92,14 +93,14 @@ def main():
     parser.add_argument(
         "--inputs", nargs="+",
         default=[
-            os.path.join(DATA_DIR, "armenian_qa.json"),
-            os.path.join(DATA_DIR, "armbench_train.json"),
-            os.path.join(DATA_DIR, "aya_armenian.json"),
+            os.path.join(TEXT_FINETUNE_DIR, "armenian_qa.json"),
+            os.path.join(TEXT_FINETUNE_DIR, "armbench_train.json"),
+            os.path.join(TEXT_FINETUNE_DIR, "aya_armenian.json"),
         ],
     )
     parser.add_argument(
         "--output",
-        default=os.path.join(DATA_DIR, "qa_merged.json"),
+        default=os.path.join(TEXT_FINETUNE_DIR, "qa_merged.json"),
     )
     args = parser.parse_args()
     merge_sft_sources(args.inputs, args.output)

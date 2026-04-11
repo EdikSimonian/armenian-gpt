@@ -1,24 +1,26 @@
 """
 Step 2: Prepare the data for tokenization.
 
-Default mode (corpus): Cleans data/raw_text.txt (produced by 1_download.py)
-and writes a normalized version to data/clean_text.txt. Cleaning keeps only
-Armenian letters, ASCII punctuation, digits, and whitespace (NFC normalized).
+Default mode (corpus): Cleans data/text/train/raw_text.txt (produced by
+1_download.py) and writes a normalized version to data/text/train/clean_text.txt.
+Cleaning keeps only Armenian letters, ASCII punctuation, digits, and
+whitespace (NFC normalized).
 
 Memory-safe: processes text in parallel segments, each worker handling its
 segment in 50 MB chunks. Safe for 20+ GB inputs.
 
---qa mode: Merges the SFT JSON files produced by 1_download.py --qa
-(armbench_{train,eval}.json + aya_armenian.json + optional
-armenian_qa.json) into a single deduplicated data/qa_merged.json.
+--qa mode: Merges the SFT JSON files under data/text/finetune/ produced by
+1_download.py --qa (armbench_{train,eval}.json + aya_armenian.json, plus
+an optional Claude-generated armenian_qa.json) into a single deduplicated
+data/text/finetune/qa_merged.json.
 
 Usage:
     python 2_prepare.py           # corpus mode
     python 2_prepare.py --qa      # Q&A mode
 
 Outputs:
-    corpus: data/clean_text.txt
-    qa:     data/qa_merged.json
+    corpus: data/text/train/clean_text.txt
+    qa:     data/text/finetune/qa_merged.json
 """
 
 import os
@@ -27,9 +29,12 @@ import sys
 import unicodedata
 from multiprocessing import Pool, cpu_count
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-RAW_FILE = os.path.join(DATA_DIR, "raw_text.txt")
-CLEAN_FILE = os.path.join(DATA_DIR, "clean_text.txt")
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(_REPO_ROOT, "data")
+TEXT_TRAIN_DIR = os.path.join(DATA_DIR, "text", "train")
+TEXT_FINETUNE_DIR = os.path.join(DATA_DIR, "text", "finetune")
+RAW_FILE = os.path.join(TEXT_TRAIN_DIR, "raw_text.txt")
+CLEAN_FILE = os.path.join(TEXT_TRAIN_DIR, "clean_text.txt")
 
 # Regex patterns compiled once
 _RE_NON_ARMENIAN = re.compile(r"[^\u0530-\u058F\uFB13-\uFB17 \n\t.,;:!?\-()\"'0-9]")
@@ -68,7 +73,7 @@ def _clean_segment(args):
     """Clean one segment of the file in small chunks (for multiprocessing)."""
     input_path, start_byte, end_byte, segment_id = args
     chunk_size = 50_000_000
-    out_path = os.path.join(DATA_DIR, f"clean_seg_{segment_id}.txt")
+    out_path = os.path.join(TEXT_TRAIN_DIR, f"clean_seg_{segment_id}.txt")
     out_chars = 0
     with open(input_path, "rb") as fin, open(out_path, "w", encoding="utf-8") as fout:
         fin.seek(start_byte)
@@ -159,19 +164,19 @@ def prepare_corpus():
 
 
 def prepare_qa():
-    """Merge the SFT source JSONs into data/qa_merged.json."""
+    """Merge the SFT source JSONs into data/text/finetune/qa_merged.json."""
     from core.merge_sft_sources import merge_sft_sources
 
     # Inputs in priority order — earlier sources win dedup ties.
     # armenian_qa.json is only present if the user ran the optional Claude
-    # generator (data/generate_armenian_qa.py); it's merged in first so its
+    # generator (core/generate_armenian_qa.py); it's merged in first so its
     # hand-crafted pairs take priority over the larger translated sets.
     input_paths = [
-        os.path.join(DATA_DIR, "armenian_qa.json"),    # optional, from Claude
-        os.path.join(DATA_DIR, "armbench_train.json"), # native exam QA
-        os.path.join(DATA_DIR, "aya_armenian.json"),   # filtered Aya
+        os.path.join(TEXT_FINETUNE_DIR, "armenian_qa.json"),    # optional, Claude
+        os.path.join(TEXT_FINETUNE_DIR, "armbench_train.json"), # native exam QA
+        os.path.join(TEXT_FINETUNE_DIR, "aya_armenian.json"),   # filtered Aya
     ]
-    output_path = os.path.join(DATA_DIR, "qa_merged.json")
+    output_path = os.path.join(TEXT_FINETUNE_DIR, "qa_merged.json")
 
     print(f"\n{'='*50}")
     print(f"  Step 2: Merge SFT sources (--qa)")
@@ -179,7 +184,7 @@ def prepare_qa():
 
     n = merge_sft_sources(input_paths, output_path)
     if n == 0:
-        print(f"\nError: no Q&A sources found in {DATA_DIR}.")
+        print(f"\nError: no Q&A sources found in {TEXT_FINETUNE_DIR}.")
         print("Run 'python 1_download.py --qa' first.")
         sys.exit(1)
 

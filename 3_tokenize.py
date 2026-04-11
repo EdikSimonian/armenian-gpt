@@ -1,11 +1,11 @@
 """
 Step 3: Tokenize the prepared data.
 
-Default mode (corpus): Reads data/clean_text.txt (produced by 2_prepare.py),
-trains either a character-level or BPE (SentencePiece) tokenizer, and writes
-the encoded corpus as a 90/10 train/val split.
+Default mode (corpus): Reads data/text/train/clean_text.txt (produced by
+2_prepare.py), trains either a character-level or BPE (SentencePiece)
+tokenizer, and writes the encoded corpus as a 90/10 train/val split.
 
---qa mode: Reads data/qa_merged.json (produced by 2_prepare.py --qa), loads
+--qa mode: Reads data/text/finetune/qa_merged.json (produced by 2_prepare.py --qa), loads
 the Stage 1 tokenizer from data/tokenizer_{type}.json, extends it with chat
 special tokens (<|user|>, <|assistant|>, <|end|>), and writes the chat-
 formatted conversations as train/val bins under data_chat/.
@@ -38,8 +38,11 @@ from multiprocessing import Pool, cpu_count
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
-CLEAN_FILE = os.path.join(DATA_DIR, "clean_text.txt")
+_REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(_REPO_ROOT, "data")
+TEXT_TRAIN_DIR = os.path.join(DATA_DIR, "text", "train")
+TEXT_FINETUNE_DIR = os.path.join(DATA_DIR, "text", "finetune")
+CLEAN_FILE = os.path.join(TEXT_TRAIN_DIR, "clean_text.txt")
 
 
 def _find_segment_boundaries(path, num_segments):
@@ -280,7 +283,7 @@ def tokenize_qa(tokenizer_type):
     """Tokenize the merged SFT JSON into data_chat/*.bin for fine-tuning."""
     from core.prepare_chat import prepare_chat_data
 
-    source_path = os.path.join(DATA_DIR, "qa_merged.json")
+    source_path = os.path.join(TEXT_FINETUNE_DIR, "qa_merged.json")
     if not os.path.exists(source_path):
         print(f"Error: {source_path} not found!")
         print("Run 'python 2_prepare.py --qa' first to merge SFT sources.")
@@ -304,7 +307,7 @@ def main():
                         choices=["char", "bpe"],
                         help="Tokenizer type: 'char' (Level 1) or 'bpe' (Level 2)")
     parser.add_argument("--qa", action="store_true",
-                        help="Tokenize Q&A data (data/qa_merged.json) into data_chat/ "
+                        help="Tokenize Q&A data (data/text/finetune/qa_merged.json) into data_chat/ "
                              "instead of the raw corpus")
     args = parser.parse_args()
 
