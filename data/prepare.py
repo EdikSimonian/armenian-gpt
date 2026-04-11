@@ -12,9 +12,12 @@ Usage:
     python data/prepare.py --tokenizer bpe   # for Level 2
 
 After running, you'll have:
-    data/train.bin  - training data (90%)
-    data/val.bin    - validation data (10%)
-    data/tokenizer.json - tokenizer metadata
+    data/train_{char|bpe}.bin    - training data (90%)
+    data/val_{char|bpe}.bin      - validation data (10%)
+    data/tokenizer_{char|bpe}.json - tokenizer metadata
+
+Each tokenizer writes to its own suffixed filenames so the two pipelines
+coexist on disk (switching --tokenizer does not clobber the other set).
 """
 
 import os
@@ -410,8 +413,8 @@ def main():
 
     # Step 5: Split into train/val
     print("\nStep 4: Splitting train/val (90/10)...")
-    train_path = os.path.join(DATA_DIR, "train.bin")
-    val_path = os.path.join(DATA_DIR, "val.bin")
+    from tokenizers import bin_paths, tokenizer_path
+    train_path, val_path = bin_paths(DATA_DIR, args.tokenizer)
     split_bin_file(all_tokens_path, train_path, val_path)
 
     # Clean up temporary files
@@ -419,7 +422,7 @@ def main():
     print(f"\n  Removed temporary file: all_tokens.bin")
 
     # Step 6: Save tokenizer
-    tok_path = os.path.join(DATA_DIR, "tokenizer.json")
+    tok_path = tokenizer_path(DATA_DIR, args.tokenizer)
     tokenizer.save(tok_path)
 
     # Print summary

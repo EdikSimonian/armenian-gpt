@@ -13,31 +13,24 @@ Type 'quit' or 'exit' to stop.
 """
 
 import argparse
-import json
 import os
 import sys
 import torch
 
 from model import GPT
+from tokenizers import detect_tokenizer_type, load_tokenizer as _load_tokenizer
 
 
-def load_tokenizer(data_dir):
+def load_tokenizer(data_dir, tokenizer_type=None):
     """Load the extended tokenizer with special chat tokens."""
-    tok_path = os.path.join(data_dir, "tokenizer.json")
-    if not os.path.exists(tok_path):
-        print(f"Error: {tok_path} not found!")
+    try:
+        if tokenizer_type is None:
+            tokenizer_type = detect_tokenizer_type(data_dir)
+        return _load_tokenizer(data_dir, tokenizer_type)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}")
         print("Run 'python data/prepare_chat.py' first.")
         sys.exit(1)
-
-    with open(tok_path, "r", encoding="utf-8") as f:
-        tok_data = json.load(f)
-
-    if tok_data.get("type") == "bpe":
-        from tokenizers.bpe_tokenizer import BPETokenizer
-        return BPETokenizer.load(tok_path)
-    else:
-        from tokenizers.char_tokenizer import CharTokenizer
-        return CharTokenizer.load(tok_path)
 
 
 def main():
@@ -51,7 +44,10 @@ def main():
     parser.add_argument("--max_length", type=int, default=300,
                         help="Maximum response length in tokens")
     parser.add_argument("--data_dir", type=str, default="data_chat",
-                        help="Directory with tokenizer.json")
+                        help="Directory containing the chat tokenizer file")
+    parser.add_argument("--tokenizer", type=str, default=None,
+                        choices=["char", "bpe"],
+                        help="Tokenizer type. If omitted, auto-detects from data_dir.")
     args = parser.parse_args()
 
     # Load checkpoint
@@ -81,7 +77,7 @@ def main():
         device = "cpu"
 
     # Load tokenizer
-    tokenizer = load_tokenizer(args.data_dir)
+    tokenizer = load_tokenizer(args.data_dir, args.tokenizer)
 
     # Get special token IDs
     end_ids = tokenizer.encode("<|end|>")

@@ -11,9 +11,11 @@ Usage:
     python data/prepare_chat.py
 
 After running, you'll have:
-    data_chat/train.bin      - training data (90%)
-    data_chat/val.bin        - validation data (10%)
-    data_chat/tokenizer.json - extended vocabulary with chat tokens
+    data_chat/train_{char|bpe}.bin      - training data (90%)
+    data_chat/val_{char|bpe}.bin        - validation data (10%)
+    data_chat/tokenizer_{char|bpe}.json - extended vocabulary with chat tokens
+
+The tokenizer type is auto-detected from data/ unless --tokenizer is passed.
 """
 
 import os
@@ -107,7 +109,26 @@ def main():
     parser.add_argument("--source", type=str, default=None,
                         help="Path to pre-generated JSON file (e.g. data/armenian_qa.json). "
                              "If omitted, downloads Alpaca-Armenian from HuggingFace.")
+    parser.add_argument("--tokenizer", type=str, default=None,
+                        choices=["char", "bpe"],
+                        help="Stage 1 tokenizer type. If omitted, auto-detects from data/.")
     args = parser.parse_args()
+
+    # Resolve the Stage 1 tokenizer type (explicit or auto-detect).
+    from tokenizers import (
+        bin_paths,
+        detect_tokenizer_type,
+        load_tokenizer as _load_tokenizer,
+        tokenizer_path,
+    )
+    if args.tokenizer:
+        tok_type = args.tokenizer
+    else:
+        try:
+            tok_type = detect_tokenizer_type(DATA_DIR)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"\nError: {e}")
+            sys.exit(1)
 
     # Step 1: Create output directory
     os.makedirs(CHAT_DIR, exist_ok=True)
@@ -138,25 +159,15 @@ def main():
     print(f"  Total text: {len(text):,} characters")
 
     # Step 5: Load Stage 1 tokenizer and extend with special tokens
-    stage1_tok_path = os.path.join(DATA_DIR, "tokenizer.json")
+    stage1_tok_path = tokenizer_path(DATA_DIR, tok_type)
     if not os.path.exists(stage1_tok_path):
         print(f"\nError: {stage1_tok_path} not found!")
         print("Run Stage 1 data preparation first:")
-        print("  python data/download.py")
-        print("  python data/prepare.py")
+        print("  python data/download_all.py")
+        print(f"  python data/prepare.py --tokenizer {tok_type}")
         sys.exit(1)
 
-    # Detect tokenizer type from saved metadata
-    with open(stage1_tok_path, "r", encoding="utf-8") as f:
-        tok_meta = json.load(f)
-    tok_type = tok_meta.get("type", "char")
-
-    if tok_type == "bpe":
-        from tokenizers.bpe_tokenizer import BPETokenizer
-        tokenizer = BPETokenizer.load(stage1_tok_path)
-    else:
-        from tokenizers.char_tokenizer import CharTokenizer
-        tokenizer = CharTokenizer.load(stage1_tok_path)
+    tokenizer = _load_tokenizer(DATA_DIR, tok_type)
 
     old_vocab_size = tokenizer.vocab_size
     print(f"\nStage 1 vocabulary: {old_vocab_size} tokens (type: {tok_type})")
@@ -189,10 +200,9 @@ def main():
     train_ids = token_ids[:split_idx]
     val_ids = token_ids[split_idx:]
 
-    # Step 8: Save everything
-    train_path = os.path.join(CHAT_DIR, "train.bin")
-    val_path = os.path.join(CHAT_DIR, "val.bin")
-    tok_path = os.path.join(CHAT_DIR, "tokenizer.json")
+    # Step 8: Save everything (suffixed so char and BPE can coexist)
+    train_path, val_path = bin_paths(CHAT_DIR, tok_type)
+    tok_path = tokenizer_path(CHAT_DIR, tok_type)
 
     train_ids.tofile(train_path)
     val_ids.tofile(val_path)

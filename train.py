@@ -10,7 +10,7 @@ Usage:
     python train.py --resume_from checkpoints/step_1000.pt  # resume training
 
 What happens during training:
-    1. Load the prepared data (data/train.bin and data/val.bin)
+    1. Load the prepared data (data/train_{char|bpe}.bin and data/val_*.bin)
     2. Create the GPT model
     3. Repeatedly: grab a batch of text, predict next tokens, learn from mistakes
     4. Every N steps: check validation loss, generate sample text, save checkpoint
@@ -38,14 +38,14 @@ from model import GPT
 from config import get_config
 
 
-def load_data(data_dir, device):
-    """Load pre-encoded training and validation data."""
-    train_path = os.path.join(data_dir, "train.bin")
-    val_path = os.path.join(data_dir, "val.bin")
+def load_data(data_dir, tokenizer_type, device):
+    """Load pre-encoded training and validation data for the given tokenizer."""
+    from tokenizers import bin_paths
+    train_path, val_path = bin_paths(data_dir, tokenizer_type)
 
     if not os.path.exists(train_path):
         print(f"Error: {train_path} not found!")
-        print("Run 'python data/download.py' and 'python data/prepare.py' first.")
+        print(f"Run 'python data/prepare.py --tokenizer {tokenizer_type}' first.")
         sys.exit(1)
 
     # Memory-map to avoid loading multi-GB datasets into RAM
@@ -59,20 +59,13 @@ def load_data(data_dir, device):
 
 def load_tokenizer(data_dir, tokenizer_type):
     """Load the tokenizer that was used during data preparation."""
-    tok_path = os.path.join(data_dir, "tokenizer.json")
-    if not os.path.exists(tok_path):
-        print(f"Error: {tok_path} not found! Run data/prepare.py first.")
+    from tokenizers import load_tokenizer as _load, tokenizer_path
+    path = tokenizer_path(data_dir, tokenizer_type)
+    if not os.path.exists(path):
+        print(f"Error: {path} not found! "
+              f"Run data/prepare.py --tokenizer {tokenizer_type} first.")
         sys.exit(1)
-
-    with open(tok_path, "r", encoding="utf-8") as f:
-        tok_data = json.load(f)
-
-    if tok_data["type"] == "char":
-        from tokenizers.char_tokenizer import CharTokenizer
-        return CharTokenizer.load(tok_path)
-    else:
-        from tokenizers.bpe_tokenizer import BPETokenizer
-        return BPETokenizer.load(tok_path)
+    return _load(data_dir, tokenizer_type)
 
 
 def get_batch(data, block_size, batch_size, device):
@@ -145,7 +138,7 @@ def main():
     print(f"{'='*50}\n")
 
     # Load data and tokenizer
-    train_data, val_data = load_data(cfg["data_dir"], device)
+    train_data, val_data = load_data(cfg["data_dir"], cfg["tokenizer"], device)
     tokenizer = load_tokenizer(cfg["data_dir"], cfg["tokenizer"])
     print(f"Vocab size: {tokenizer.vocab_size}")
 

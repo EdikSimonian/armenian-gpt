@@ -11,25 +11,21 @@ Usage:
 """
 
 import argparse
-import json
 import os
 import torch
 
 from model import GPT
+from tokenizers import detect_tokenizer_type, load_tokenizer as _load_tokenizer
 
 
-def load_tokenizer(data_dir):
-    """Load the tokenizer used during training."""
-    tok_path = os.path.join(data_dir, "tokenizer.json")
-    with open(tok_path, "r", encoding="utf-8") as f:
-        tok_data = json.load(f)
+def load_tokenizer(data_dir, tokenizer_type=None):
+    """Load the tokenizer used during training.
 
-    if tok_data["type"] == "char":
-        from tokenizers.char_tokenizer import CharTokenizer
-        return CharTokenizer.load(tok_path)
-    else:
-        from tokenizers.bpe_tokenizer import BPETokenizer
-        return BPETokenizer.load(tok_path)
+    If tokenizer_type is None, auto-detects from data_dir.
+    """
+    if tokenizer_type is None:
+        tokenizer_type = detect_tokenizer_type(data_dir)
+    return _load_tokenizer(data_dir, tokenizer_type)
 
 
 def main():
@@ -50,7 +46,10 @@ def main():
     parser.add_argument("--num_samples", type=int, default=1,
                         help="How many samples to generate")
     parser.add_argument("--data_dir", type=str, default="data",
-                        help="Directory with tokenizer.json")
+                        help="Directory containing the tokenizer file")
+    parser.add_argument("--tokenizer", type=str, default=None,
+                        choices=["char", "bpe"],
+                        help="Tokenizer type. If omitted, auto-detects from data_dir.")
     args = parser.parse_args()
 
     # Load checkpoint
@@ -72,7 +71,7 @@ def main():
         device = "cpu"
 
     # Load tokenizer
-    tokenizer = load_tokenizer(args.data_dir)
+    tokenizer = load_tokenizer(args.data_dir, args.tokenizer)
 
     # Create model and load weights
     model = GPT(

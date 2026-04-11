@@ -235,9 +235,12 @@ def main():
     parser.add_argument("--chat_checkpoint", type=str, default=None,
                         help="Path to chat-finetuned checkpoint (optional)")
     parser.add_argument("--data_dir", type=str, default="data",
-                        help="Directory with tokenizer.json")
+                        help="Directory containing the tokenizer file")
     parser.add_argument("--chat_data_dir", type=str, default="data_chat",
-                        help="Directory with chat tokenizer.json")
+                        help="Directory containing the chat tokenizer file")
+    parser.add_argument("--tokenizer", type=str, default=None,
+                        choices=["char", "bpe"],
+                        help="Tokenizer type. If omitted, auto-detects from data_dir.")
     parser.add_argument("--output_dir", type=str, default=None,
                         help="Directory for converted files (default: temp dir)")
     parser.add_argument("--private", action="store_true",
@@ -251,7 +254,16 @@ def main():
         print(f"Error: checkpoint not found: {args.checkpoint}")
         return
 
-    tokenizer_path = os.path.join(args.data_dir, "tokenizer.json")
+    from tokenizers import (
+        detect_tokenizer_type,
+        tokenizer_path as _tokenizer_path,
+    )
+    try:
+        tok_type = args.tokenizer or detect_tokenizer_type(args.data_dir)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Error: {e}")
+        return
+    tokenizer_path = _tokenizer_path(args.data_dir, tok_type)
     if not os.path.exists(tokenizer_path):
         print(f"Error: tokenizer not found: {tokenizer_path}")
         return
@@ -275,7 +287,7 @@ def main():
         chat_ckpt = torch.load(args.chat_checkpoint, map_location="cpu", weights_only=False)
         torch.save(chat_ckpt["model"], os.path.join(output_dir, "chat_model.pt"))
 
-        chat_tok_path = os.path.join(args.chat_data_dir, "tokenizer.json")
+        chat_tok_path = _tokenizer_path(args.chat_data_dir, tok_type)
         if os.path.exists(chat_tok_path):
             shutil.copy2(chat_tok_path, os.path.join(output_dir, "chat_tokenizer.json"))
         chat_included = True

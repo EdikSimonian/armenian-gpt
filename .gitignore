@@ -5,10 +5,7 @@ data/*.bz2
 data/*.model
 data/*.vocab
 data/*.json
-data/tokenizer.json
-data/tokenizer_char.json
 data/.*_done
-data/clean_text.txt
 data/qa_parts/
 data_chat/
 
