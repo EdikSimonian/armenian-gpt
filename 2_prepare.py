@@ -1,210 +1,351 @@
 """
-Step 2: Prepare the data for tokenization.
+Step 2: Clean + dedup + merge the corpus sources.
 
-Default mode (corpus): Cleans data/text/train/raw_text.txt (produced by
-1_download.py) and writes a normalized version to data/text/train/clean_text.txt.
-Cleaning keeps only Armenian letters, ASCII punctuation, digits, and
-whitespace (NFC normalized).
+Corpus mode (default):
+    Reads the 12 per-source `{name}_hy.txt` files produced by 1_download.py,
+    cleans each (NFC normalize, Armenian-script whitelist, collapse
+    whitespace), deduplicates at the paragraph level across ALL sources,
+    and merges into a single data/text/train/clean_text.txt ready for
+    the tokenizer (3_tokenize.py).
 
-Memory-safe: processes text in parallel segments, each worker handling its
-segment in 50 MB chunks. Safe for 20+ GB inputs.
+    Dedup is exact at the paragraph level using blake2b-64 hashes.
+    Sources are processed in quality-priority order — paragraphs from
+    earlier (higher-quality / native) sources win dedup ties, so the
+    web-crawl sources act as fillers for gaps the curated sources miss.
 
---qa mode: Merges the SFT JSON files under data/text/finetune/ produced by
-1_download.py --qa (armbench_{train,eval}.json + aya_armenian.json, plus
-an optional Claude-generated armenian_qa.json) into a single deduplicated
-data/text/finetune/qa_merged.json.
+--qa mode:
+    Merges SFT JSON files under data/text/finetune/ produced by
+    1_download.py --qa (+ any generated Q&A pairs) into a deduplicated
+    qa_merged.json.
 
 Usage:
-    python 2_prepare.py           # corpus mode
-    python 2_prepare.py --qa      # Q&A mode
+    python 2_prepare.py              # corpus clean + dedup + merge
+    python 2_prepare.py --no-dedup   # corpus clean + merge, no dedup
+    python 2_prepare.py --qa         # Q&A merge
 
 Outputs:
     corpus: data/text/train/clean_text.txt
+            data/text/train/clean_stats.json
     qa:     data/text/finetune/qa_merged.json
 """
 
+import hashlib
+import json
 import os
 import re
 import sys
+import time
 import unicodedata
-from multiprocessing import Pool, cpu_count
 
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(_REPO_ROOT, "data")
 TEXT_TRAIN_DIR = os.path.join(DATA_DIR, "text", "train")
 TEXT_FINETUNE_DIR = os.path.join(DATA_DIR, "text", "finetune")
-RAW_FILE = os.path.join(TEXT_TRAIN_DIR, "raw_text.txt")
 CLEAN_FILE = os.path.join(TEXT_TRAIN_DIR, "clean_text.txt")
+STATS_FILE = os.path.join(TEXT_TRAIN_DIR, "clean_stats.json")
 
-# Regex patterns compiled once
-_RE_NON_ARMENIAN = re.compile(r"[^\u0530-\u058F\uFB13-\uFB17 \n\t.,;:!?\-()\"'0-9]")
+# Source ordering for dedup-priority. Sources listed first "win" dedup ties
+# when their paragraphs also appear in lower-priority web-crawl sources.
+# Order rationale:
+#   1. Wikimedia (native curated, CC BY-SA)
+#   2. ARLIS (formal legal Armenian, unique domain)
+#   3. News / small curated
+#   4. HPLT 3.0 (best-extracted web)
+#   5. CulturaX, FineTranslations (cleaned web variants)
+#   6. mC4, CC-100 (older/noisier web baselines)
+SOURCE_ORDER = [
+    "wiki",
+    "wikisource",
+    "wiktionary",
+    "wikiquote",
+    "arlis",
+    "ccnews",
+    "glot500",
+    "hplt3",
+    "culturax",
+    "finetranslations",
+    "mc4",
+    "cc100",
+]
+
+# Minimum paragraph length (in cleaned chars) to keep. Drops navigation
+# leftovers, single-word fragments, and broken OCR lines.
+MIN_PARAGRAPH_CHARS = 50
+
+# Read/write buffer (bytes)
+IO_BUFFER = 16 * 1024 * 1024
+
+# Regex patterns compiled once at module load.
+# Armenian block U+0530-U+058F covers the alphabet. U+FB13-U+FB17 are
+# ligatures that appear in older printing. We also keep ASCII punctuation,
+# digits, and whitespace so the tokenizer sees real sentences.
+_RE_NON_ARMENIAN = re.compile(
+    r"[^\u0530-\u058F\uFB13-\uFB17 \n\t.,;:!?\-()\"'0-9]"
+)
 _RE_SPACES = re.compile(r"[ \t]+")
 _RE_NEWLINES = re.compile(r"\n{3,}")
+_RE_PARAGRAPH_SPLIT = re.compile(r"\n\s*\n+")
 
 
-def clean_chunk(chunk):
-    """Clean a chunk of text. Keeps Armenian letters, punctuation, digits, whitespace."""
+def clean_chunk(chunk: str) -> str:
+    """Normalize + whitelist-filter + collapse whitespace on one text blob."""
     chunk = unicodedata.normalize("NFC", chunk)
     chunk = _RE_NON_ARMENIAN.sub("", chunk)
     chunk = _RE_SPACES.sub(" ", chunk)
     chunk = _RE_NEWLINES.sub("\n\n", chunk)
-    return chunk
+    return chunk.strip()
 
 
-def _find_segment_boundaries(path, num_segments):
-    """Find byte offsets that split a file into segments at newline boundaries."""
-    file_size = os.path.getsize(path)
-    boundaries = [0]
-    with open(path, "rb") as f:
-        for i in range(1, num_segments):
-            target = (file_size * i) // num_segments
-            f.seek(target)
-            chunk = f.read(8192)
-            nl = chunk.find(b"\n")
-            if nl != -1:
-                boundaries.append(target + nl + 1)
-            else:
-                boundaries.append(target)
-    boundaries.append(file_size)
-    return boundaries
+def hash_paragraph(text: str) -> bytes:
+    """Cheap 64-bit hash of a cleaned paragraph for cross-source dedup.
+
+    blake2b is in the stdlib, faster than md5 for short strings, and
+    64-bit digest gives 1.8e19 distinct values — collision probability
+    is negligible even for 100M paragraphs (~10^-4 total by birthday
+    paradox).
+    """
+    return hashlib.blake2b(text.encode("utf-8"), digest_size=8).digest()
 
 
-def _clean_segment(args):
-    """Clean one segment of the file in small chunks (for multiprocessing)."""
-    input_path, start_byte, end_byte, segment_id = args
-    chunk_size = 50_000_000
-    out_path = os.path.join(TEXT_TRAIN_DIR, f"clean_seg_{segment_id}.txt")
-    out_chars = 0
-    with open(input_path, "rb") as fin, open(out_path, "w", encoding="utf-8") as fout:
-        fin.seek(start_byte)
-        while fin.tell() < end_byte:
-            remaining = end_byte - fin.tell()
-            read_size = min(chunk_size, remaining)
-            raw_bytes = fin.read(read_size)
-            if not raw_bytes:
-                break
-            if fin.tell() < end_byte:
-                extra = fin.read(8192)
-                if extra:
-                    nl = extra.find(b"\n")
-                    if nl != -1:
-                        raw_bytes += extra[:nl + 1]
-                        fin.seek(-(len(extra) - nl - 1), 1)
-                    else:
-                        raw_bytes += extra
-            text = raw_bytes.decode("utf-8", errors="ignore")
-            cleaned = clean_chunk(text)
-            fout.write(cleaned)
-            out_chars += len(cleaned)
-    seg_mb = (end_byte - start_byte) / (1024 * 1024)
-    print(f"  Segment {segment_id}: {seg_mb:.0f} MB -> {out_chars / 1_000_000:.0f}M clean chars")
-    return out_path, out_chars
+def iter_paragraphs(fp, min_bytes=50):
+    """Stream paragraphs from a text file, delimited by blank lines.
+
+    Reads in chunks and yields complete paragraphs (strings). Incomplete
+    paragraphs at chunk boundaries are carried over. Handles multi-GB
+    files without materializing them in memory.
+    """
+    carry = ""
+    while True:
+        chunk = fp.read(IO_BUFFER)
+        if not chunk:
+            if carry.strip():
+                yield carry
+            return
+        combined = carry + chunk
+        parts = _RE_PARAGRAPH_SPLIT.split(combined)
+        # Last element may be a partial paragraph — carry it over
+        # unless EOF on next iteration.
+        carry = parts.pop()
+        for p in parts:
+            if len(p) >= min_bytes:
+                yield p
 
 
-def clean_file_chunked(input_path, output_path):
-    """Clean the raw text file in parallel, writing concatenated output."""
-    total_bytes = os.path.getsize(input_path)
-    total_mb = total_bytes / (1024 * 1024)
-    num_workers = min(cpu_count(), 16)
-    print(f"  Cleaning {total_mb:.0f} MB in parallel with {num_workers} workers...")
+def process_source(src_name: str, src_path: str, seen: set, fout,
+                   dedup: bool, stats: dict) -> None:
+    """Clean + optionally dedup one source file, writing to the merged output.
 
-    boundaries = _find_segment_boundaries(input_path, num_workers)
-    args = [
-        (input_path, boundaries[i], boundaries[i + 1], i)
-        for i in range(len(boundaries) - 1)
-    ]
-    with Pool(num_workers) as pool:
-        results = pool.map(_clean_segment, args)
-
-    out_chars = 0
-    with open(output_path, "w", encoding="utf-8") as fout:
-        for seg_path, seg_chars in results:
-            out_chars += seg_chars
-            with open(seg_path, "r", encoding="utf-8") as fin:
-                while True:
-                    chunk = fin.read(100_000_000)
-                    if not chunk:
-                        break
-                    fout.write(chunk)
-            os.remove(seg_path)
-
-    print(f"  Cleaned: {out_chars:,} characters")
-    return out_chars
-
-
-def prepare_corpus():
-    if not os.path.exists(RAW_FILE):
-        print(f"Error: {RAW_FILE} not found!")
-        print("Run 'python 1_download.py' first to download the data.")
-        sys.exit(1)
-
-    raw_size = os.path.getsize(RAW_FILE)
-    print(f"\n{'='*50}")
-    print(f"  Step 2: Clean raw text")
-    print(f"{'='*50}")
-    print(f"  Input:  {RAW_FILE} ({raw_size / 1024 / 1024:.0f} MB)")
-    print(f"  Output: {CLEAN_FILE}")
-    print(f"{'='*50}\n")
-
-    if os.path.exists(CLEAN_FILE) and os.path.getmtime(CLEAN_FILE) > os.path.getmtime(RAW_FILE):
-        clean_size = os.path.getsize(CLEAN_FILE)
-        print(f"Skipping — {CLEAN_FILE} is already up to date "
-              f"({clean_size / 1024 / 1024:.0f} MB).")
-        print("Next step: python 3_tokenize.py --tokenizer bpe")
+    Updates `seen` (global hash set) and `stats` in place. Writes kept
+    paragraphs to `fout`, separated by blank lines.
+    """
+    if not os.path.exists(src_path):
+        print(f"  [{src_name}] MISSING ({src_path}) — skipping")
+        stats[src_name] = {"status": "missing"}
         return
 
-    clean_file_chunked(RAW_FILE, CLEAN_FILE)
+    size_mb = os.path.getsize(src_path) / (1024 * 1024)
+    t0 = time.time()
+    in_chars = 0
+    out_chars = 0
+    kept_paras = 0
+    drop_short = 0
+    drop_dupes = 0
 
+    with open(src_path, "r", encoding="utf-8", errors="ignore") as fin:
+        for para in iter_paragraphs(fin):
+            in_chars += len(para)
+            cleaned = clean_chunk(para)
+            if len(cleaned) < MIN_PARAGRAPH_CHARS:
+                drop_short += 1
+                continue
+            if dedup:
+                h = hash_paragraph(cleaned)
+                if h in seen:
+                    drop_dupes += 1
+                    continue
+                seen.add(h)
+            fout.write(cleaned)
+            fout.write("\n\n")
+            out_chars += len(cleaned) + 2
+            kept_paras += 1
+
+    elapsed = time.time() - t0
+    compression = (1.0 - out_chars / in_chars) * 100 if in_chars else 0.0
+
+    stats[src_name] = {
+        "status": "ok",
+        "size_mb_in": size_mb,
+        "chars_in": in_chars,
+        "chars_out": out_chars,
+        "kept_paragraphs": kept_paras,
+        "dropped_short": drop_short,
+        "dropped_duplicates": drop_dupes,
+        "compression_pct": round(compression, 1),
+        "elapsed_sec": round(elapsed, 1),
+    }
+
+    dup_pct = (drop_dupes / (kept_paras + drop_dupes) * 100
+               if (kept_paras + drop_dupes) else 0.0)
+    print(
+        f"  [{src_name:17s}] "
+        f"{size_mb:>6.0f} MB in → {out_chars / 1024 / 1024:>6.0f} MB out  "
+        f"(-{compression:>4.1f}%)  "
+        f"kept {kept_paras:>8,}  "
+        f"dupes {drop_dupes:>8,} ({dup_pct:>4.1f}%)  "
+        f"short {drop_short:>6,}  "
+        f"in {elapsed:>5.0f}s"
+    )
+
+
+def prepare_corpus(no_dedup: bool = False) -> None:
+    """Clean + dedup + merge all 12 per-source corpus files."""
+    # Resolve source paths and verify at least some exist before starting.
+    sources = [
+        (name, os.path.join(TEXT_TRAIN_DIR, f"{name}_hy.txt"))
+        for name in SOURCE_ORDER
+    ]
+    existing = [(n, p) for n, p in sources if os.path.exists(p)]
+    missing = [n for n, p in sources if not os.path.exists(p)]
+
+    if not existing:
+        print(f"Error: no source files found in {TEXT_TRAIN_DIR}.")
+        print("Run 'python 1_download.py' first.")
+        sys.exit(1)
+
+    total_bytes = sum(os.path.getsize(p) for _, p in existing)
+    total_gb = total_bytes / (1024 ** 3)
+
+    print(f"\n{'=' * 60}")
+    print(f"  Step 2: Clean + dedup + merge corpus")
+    print(f"{'=' * 60}")
+    print(f"  Sources found:  {len(existing)}/{len(sources)}")
+    print(f"  Sources missing: {missing if missing else '(none)'}")
+    print(f"  Total input:    {total_gb:.2f} GB")
+    print(f"  Dedup:          {'ON (paragraph-level, blake2b-64)' if not no_dedup else 'OFF'}")
+    print(f"  Min paragraph:  {MIN_PARAGRAPH_CHARS} chars (after cleaning)")
+    print(f"  Output:         {CLEAN_FILE}")
+    print(f"{'=' * 60}\n")
+
+    seen: set = set() if not no_dedup else None
+    stats: dict = {"sources": {}, "order": SOURCE_ORDER}
+    total_t0 = time.time()
+
+    with open(CLEAN_FILE, "w", encoding="utf-8", buffering=IO_BUFFER) as fout:
+        for src_name, src_path in sources:
+            process_source(
+                src_name, src_path,
+                seen if seen is not None else set(),
+                fout, dedup=not no_dedup,
+                stats=stats["sources"],
+            )
+
+    elapsed = time.time() - total_t0
     clean_size = os.path.getsize(CLEAN_FILE)
-    print(f"\n{'='*50}")
+    clean_gb = clean_size / (1024 ** 3)
+
+    # Aggregate totals across sources.
+    total_in = sum(s.get("chars_in", 0) for s in stats["sources"].values())
+    total_out = sum(s.get("chars_out", 0) for s in stats["sources"].values())
+    total_kept = sum(s.get("kept_paragraphs", 0) for s in stats["sources"].values())
+    total_dupes = sum(s.get("dropped_duplicates", 0) for s in stats["sources"].values())
+    total_short = sum(s.get("dropped_short", 0) for s in stats["sources"].values())
+    global_compression = (1.0 - total_out / total_in) * 100 if total_in else 0.0
+
+    stats["totals"] = {
+        "chars_in": total_in,
+        "chars_out": total_out,
+        "kept_paragraphs": total_kept,
+        "dropped_duplicates": total_dupes,
+        "dropped_short": total_short,
+        "compression_pct": round(global_compression, 1),
+        "dedup_enabled": not no_dedup,
+        "wall_time_sec": round(elapsed, 1),
+        "output_bytes": clean_size,
+        "output_gb": round(clean_gb, 2),
+    }
+    with open(STATS_FILE, "w", encoding="utf-8") as f:
+        json.dump(stats, f, ensure_ascii=False, indent=2)
+
+    print(f"\n{'=' * 60}")
     print(f"  Step 2 complete")
-    print(f"  {CLEAN_FILE}: {clean_size / 1024 / 1024:.0f} MB")
-    print(f"{'='*50}")
-    print("Next step: python 3_tokenize.py --tokenizer bpe")
+    print(f"{'=' * 60}")
+    print(f"  Input total:     {total_in / 1e9:>8.2f} G chars")
+    print(f"  Output total:    {total_out / 1e9:>8.2f} G chars  (-{global_compression:.1f}%)")
+    print(f"  Kept paragraphs: {total_kept:,}")
+    if not no_dedup:
+        dedup_rate = (total_dupes / (total_kept + total_dupes) * 100
+                      if (total_kept + total_dupes) else 0.0)
+        print(f"  Dedup drops:     {total_dupes:,} ({dedup_rate:.1f}% of all seen)")
+    print(f"  Short drops:     {total_short:,}")
+    print(f"  Final file:      {clean_gb:.2f} GB ({clean_size:,} bytes)")
+    print(f"  Wall time:       {elapsed:.0f}s ({elapsed / 60:.1f} min)")
+    print(f"  Stats sidecar:   {STATS_FILE}")
+    print()
+    print(f"Next step: python 3_tokenize.py --tokenizer bpe")
 
 
-def prepare_qa():
+def prepare_qa() -> None:
     """Merge the SFT source JSONs into data/text/finetune/qa_merged.json."""
     from core.merge_sft_sources import merge_sft_sources
 
     # Inputs in priority order — earlier sources win dedup ties.
-    # armenian_qa.json is only present if the user ran the optional Claude
-    # generator (core/generate_armenian_qa.py); it's merged in first so its
-    # hand-crafted pairs take priority over the larger translated sets.
+    # armenian_qa.json and armenian_qa_qwen*.json are only present if the
+    # user ran the optional generators; they're listed first so their
+    # native/curated pairs take priority over the larger translated sets.
+    candidates = [
+        "armenian_qa.json",           # Claude-generated (optional)
+        "armenian_qa_qwen.json",      # Qwen long-form (optional)
+        "armenian_qa_qwen_short.json",  # Qwen short (optional)
+        "armbench_train.json",        # native exam QA
+        "aya_armenian.json",          # filtered Aya (mostly translated)
+    ]
     input_paths = [
-        os.path.join(TEXT_FINETUNE_DIR, "armenian_qa.json"),    # optional, Claude
-        os.path.join(TEXT_FINETUNE_DIR, "armbench_train.json"), # native exam QA
-        os.path.join(TEXT_FINETUNE_DIR, "aya_armenian.json"),   # filtered Aya
+        os.path.join(TEXT_FINETUNE_DIR, f)
+        for f in candidates
+        if os.path.exists(os.path.join(TEXT_FINETUNE_DIR, f))
     ]
     output_path = os.path.join(TEXT_FINETUNE_DIR, "qa_merged.json")
 
-    print(f"\n{'='*50}")
+    print(f"\n{'=' * 60}")
     print(f"  Step 2: Merge SFT sources (--qa)")
-    print(f"{'='*50}")
+    print(f"{'=' * 60}")
+    print(f"  Input files: {len(input_paths)}")
+    for p in input_paths:
+        print(f"    {os.path.basename(p)}")
+    print(f"  Output:      {output_path}")
+    print(f"{'=' * 60}\n")
 
-    n = merge_sft_sources(input_paths, output_path)
-    if n == 0:
-        print(f"\nError: no Q&A sources found in {TEXT_FINETUNE_DIR}.")
+    if not input_paths:
+        print(f"Error: no Q&A sources found in {TEXT_FINETUNE_DIR}.")
         print("Run 'python 1_download.py --qa' first.")
         sys.exit(1)
 
-    print(f"\n{'='*50}")
+    n = merge_sft_sources(input_paths, output_path)
+    if n == 0:
+        print("merge returned 0 pairs — check source files for parseable JSON")
+        sys.exit(1)
+
+    print(f"\n{'=' * 60}")
     print(f"  Step 2 (--qa) complete: {n:,} unique pairs")
-    print(f"{'='*50}")
+    print(f"{'=' * 60}")
     print("Next step: python 3_tokenize.py --qa --tokenizer bpe")
 
 
-def main():
+def main() -> None:
     import argparse
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Clean/dedup/merge corpus sources, or merge SFT Q&A JSONs"
+    )
     parser.add_argument("--qa", action="store_true",
-                        help="Merge SFT Q&A JSON files instead of cleaning raw text")
+                        help="Merge SFT Q&A JSON files instead of corpus cleaning")
+    parser.add_argument("--no-dedup", action="store_true",
+                        help="Skip paragraph-level dedup (corpus mode only)")
     args = parser.parse_args()
 
     if args.qa:
         prepare_qa()
     else:
-        prepare_corpus()
+        prepare_corpus(no_dedup=args.no_dedup)
 
 
 if __name__ == "__main__":

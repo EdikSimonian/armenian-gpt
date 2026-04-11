@@ -23,10 +23,16 @@ Usage:
     python 1_download.py --qa --skip aya  # only ArmBench
 
 Outputs:
-    corpus mode: data/text/train/raw_text.txt  (~30 GB concatenated)
+    corpus mode: data/text/train/{wiki,wikisource,wiktionary,wikiquote,
+                                  cc100,hplt3,arlis,ccnews,
+                                  culturax,mc4,glot500,finetranslations}_hy.txt
+                 (one plain-text file per source; kept SEPARATE so 2_prepare.py
+                  can tokenize them with provenance tags. Each source also has
+                  a `.{name}_done` marker file alongside so reruns skip.)
     --qa mode:   data/text/finetune/armbench_train.json
                  data/text/finetune/armbench_eval.json
                  data/text/finetune/aya_armenian.json
+                 data/text/finetune/armenian_qa_qwen.json   (if generated)
 """
 
 import os
@@ -56,6 +62,14 @@ os.environ["HF_DATASETS_CACHE"] = os.path.join(HF_CACHE_DIR, "datasets")
 os.environ["HF_HUB_CACHE"] = os.path.join(HF_CACHE_DIR, "hub")
 os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(HF_CACHE_DIR, "hub")
 
+# Force pyarrow to use the system memory allocator instead of jemalloc.
+# On macOS jemalloc aggressively retains freed memory (RSS stays elevated
+# for minutes/hours after the actual allocations are gone), which inflated
+# our CC-News worker RSS to multiple GB on long scans. The system
+# allocator returns memory to the OS more eagerly. Must be set BEFORE
+# pyarrow is imported.
+os.environ["ARROW_DEFAULT_MEMORY_POOL"] = "system"
+
 import sys
 import gc
 import bz2
@@ -69,7 +83,6 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-RAW_FILE = os.path.join(TEXT_TRAIN_DIR, "raw_text.txt")
 DUMP_FILE = os.path.join(TEXT_TRAIN_DIR, "hywiki-latest-pages-articles.xml.bz2")
 WIKI_DUMP_URL = (
     "https://dumps.wikimedia.org/hywiki/latest/"
@@ -112,7 +125,22 @@ def _marker_path(name):
 
 
 def _marker_exists(name):
-    return os.path.exists(_marker_path(name))
+    """True if a source is considered already-downloaded.
+
+    Source files are kept separate on disk (one ``{name}_hy.txt`` per source)
+    so the marker additionally verifies the file exists. If somebody
+    deletes the intermediate manually, the marker is considered stale and
+    the source gets re-downloaded on the next run.
+    """
+    marker = _marker_path(name)
+    if not os.path.exists(marker):
+        return False
+    # Phase 1 and Phase 2 sources both write an intermediate named
+    # `{name}_hy.txt`. Defensive: if it's missing, treat the marker as stale.
+    expected = os.path.join(TEXT_TRAIN_DIR, f"{name}_hy.txt")
+    if not os.path.exists(expected):
+        return False
+    return True
 
 
 def _write_marker(name):
@@ -120,37 +148,25 @@ def _write_marker(name):
         f.write("done")
 
 
-def _append_to_raw(src_path):
-    """Append contents of src_path (+ blank-line separator) to raw_text.txt.
-
-    Opens raw_text.txt in append-binary mode (never truncates) and streams
-    src into it using 16 MB buffered reads. fsyncs on close so a crash
-    immediately after won't lose the committed bytes.
-    """
-    with open(RAW_FILE, "ab", buffering=IO_BUFFER) as fout:
-        with open(src_path, "rb", buffering=IO_BUFFER) as fin:
-            while True:
-                chunk = fin.read(IO_BUFFER)
-                if not chunk:
-                    break
-                fout.write(chunk)
-        fout.write(b"\n\n")
-        fout.flush()
-        os.fsync(fout.fileno())
-
-
 def _commit_source(name, src_path):
-    """Append src → raw_text.txt, delete src, write marker.
+    """Mark a source as complete. The intermediate file is KEPT on disk.
 
-    The marker is written AFTER the append completes, so a crash during
-    append leaves no marker and the source is re-downloaded on restart.
+    Per the "keep files separate" design, we do NOT merge sources into a
+    single `raw_text.txt`. Each source lives as its own `{name}_hy.txt`
+    intermediate and the downstream tokenizer (2_prepare.py) iterates
+    them at read-time, tagging each record with its source. This
+    preserves provenance and makes per-source updates cheap (rerun one
+    source without re-downloading the others).
+
+    The marker is written AFTER the file is confirmed on disk so a crash
+    during download leaves no marker and the source is retried.
     """
+    if not os.path.exists(src_path):
+        raise RuntimeError(f"[{name}] source file missing: {src_path}")
     size_mb = os.path.getsize(src_path) / (1024 * 1024)
-    print(f"  [{name}] Appending {size_mb:.0f} MB to raw_text.txt...")
-    _append_to_raw(src_path)
-    os.remove(src_path)
     _write_marker(name)
-    print(f"  [{name}] Committed ({size_mb:.0f} MB), intermediate deleted.")
+    print(f"  [{name}] Done ({size_mb:.0f} MB) → kept as "
+          f"{os.path.basename(src_path)}")
 
 
 # =============================================================================
@@ -161,13 +177,20 @@ def _commit_source(name, src_path):
 # Wikipedia
 # -----------------------------------------------------------------------------
 
-def _download_wiki_dump():
-    """Download the Armenian Wikipedia dump if not already present."""
-    if os.path.exists(DUMP_FILE):
-        print(f"  Dump already downloaded: {DUMP_FILE}")
+def _download_wikimedia_dump(url, dest_path, label, est_size_mb):
+    """Generic Wikimedia XML dump downloader.
+
+    Used by Wikipedia and all sister projects (Wikisource/Wiktionary/
+    Wikiquote). The dump file is stored at ``dest_path``; if it already
+    exists we skip the download so a rerun after a Phase 4 cleanup that
+    kept the dump around (never happens in our pipeline, but harmless)
+    doesn't re-fetch.
+    """
+    if os.path.exists(dest_path):
+        print(f"  Dump already downloaded: {dest_path}")
         return
 
-    print(f"  Downloading Armenian Wikipedia dump (~500 MB)...")
+    print(f"  Downloading {label} dump (~{est_size_mb} MB)...")
 
     def progress_hook(block_num, block_size, total_size):
         downloaded = block_num * block_size
@@ -178,8 +201,14 @@ def _download_wiki_dump():
             sys.stdout.write(f"\r    {percent:.1f}% ({mb:.1f}/{total_mb:.1f} MB)")
             sys.stdout.flush()
 
-    urllib.request.urlretrieve(WIKI_DUMP_URL, DUMP_FILE, reporthook=progress_hook)
+    urllib.request.urlretrieve(url, dest_path, reporthook=progress_hook)
     print()
+
+
+def _download_wiki_dump():
+    """Download the Armenian Wikipedia dump."""
+    _download_wikimedia_dump(WIKI_DUMP_URL, DUMP_FILE,
+                             "Armenian Wikipedia", 500)
 
 
 def _strip_wiki_markup(text):
@@ -294,9 +323,9 @@ def _extract_wiki_articles(dump_path):
 def download_wikipedia():
     """Download Armenian Wikipedia dump and extract articles to wiki_hy.txt.
 
-    Returns the path to the extracted intermediate file. Does NOT write a
-    marker — the orchestrator writes the marker only after _commit_source
-    appends the file into raw_text.txt.
+    Returns the path to the extracted file. Does NOT write a marker —
+    the orchestrator calls _commit_source afterwards which writes the
+    marker only after verifying the file is on disk.
     """
     out_file = os.path.join(TEXT_TRAIN_DIR, "wiki_hy.txt")
     if os.path.exists(out_file):
@@ -317,15 +346,85 @@ def download_wikipedia():
 
 
 # -----------------------------------------------------------------------------
+# Wikimedia sister projects (Wikisource, Wiktionary, Wikiquote)
+# -----------------------------------------------------------------------------
+# Same MediaWiki XML dump format as Wikipedia, same ns=0 filtering, same
+# markup-strip pass. The only thing that varies is the project prefix on
+# the dumps URL and the local filenames. Each project gets its own
+# intermediate + marker so it can be skipped/retried independently.
+
+def _download_wikimedia_project(project, label, est_size_mb, out_filename):
+    """Generic Wikimedia sister-project downloader.
+
+    `project` is a dump-URL identifier like "hywikisource" or "hywiktionary".
+    `out_filename` is the name of the intermediate text file under
+    TEXT_TRAIN_DIR (e.g. "wikisource_hy.txt"). Returns the output path.
+    Leaves the `.xml.bz2` dump next to the intermediate so Phase 4 cleanup
+    sweeps it away along with the wiki dump and any .xz scraps.
+    """
+    dump_name = f"{project}-latest-pages-articles.xml.bz2"
+    dump_url = f"https://dumps.wikimedia.org/{project}/latest/{dump_name}"
+    dump_path = os.path.join(TEXT_TRAIN_DIR, dump_name)
+    out_file = os.path.join(TEXT_TRAIN_DIR, out_filename)
+
+    if os.path.exists(out_file):
+        os.remove(out_file)
+
+    _download_wikimedia_dump(dump_url, dump_path, label, est_size_mb)
+
+    print("  Extracting articles...")
+    chars = 0
+    with open(out_file, "w", encoding="utf-8", buffering=IO_BUFFER) as out:
+        for article_text in _extract_wiki_articles(dump_path):
+            out.write(article_text)
+            out.write("\n\n")
+            chars += len(article_text)
+
+    print(f"  {label}: {chars:,} chars ({chars / 1024 / 1024:.0f} MB)")
+
+    # Delete the dump as soon as the extract is done — we don't need it
+    # again, and Phase 4's .bz2 sweep would catch it anyway but earlier
+    # cleanup keeps peak disk lower.
+    if os.path.exists(dump_path):
+        try:
+            os.remove(dump_path)
+        except OSError:
+            pass
+
+    return out_file
+
+
+def download_wikisource():
+    """Armenian Wikisource: classical literature, chronicles, grabar texts."""
+    return _download_wikimedia_project(
+        "hywikisource", "Armenian Wikisource", 100, "wikisource_hy.txt",
+    )
+
+
+def download_wiktionary():
+    """Armenian Wiktionary: dictionary definitions and usage examples."""
+    return _download_wikimedia_project(
+        "hywiktionary", "Armenian Wiktionary", 40, "wiktionary_hy.txt",
+    )
+
+
+def download_wikiquote():
+    """Armenian Wikiquote: literary quotations and proverbs (tiny, unique domain)."""
+    return _download_wikimedia_project(
+        "hywikiquote", "Armenian Wikiquote", 3, "wikiquote_hy.txt",
+    )
+
+
+# -----------------------------------------------------------------------------
 # CC-100 (direct download, not HuggingFace)
 # -----------------------------------------------------------------------------
 
 def download_cc100():
     """Download and decompress CC-100 Armenian data to cc100_hy.txt.
 
-    Returns the path to the decompressed intermediate file. Does NOT write
-    a marker — the orchestrator writes the marker only after _commit_source
-    appends the file into raw_text.txt.
+    Returns the path to the decompressed file. Does NOT write a marker —
+    the orchestrator writes the marker via _commit_source after the file
+    is confirmed on disk.
     """
     import lzma
 
@@ -551,6 +650,264 @@ def download_arlis():
 
 
 # -----------------------------------------------------------------------------
+# CC-News (stanford-oval/ccnews): direct parquet reads with pyarrow filtering
+# -----------------------------------------------------------------------------
+# We bypass the HuggingFace `datasets` streaming iterator here because it has
+# a known issue where Arrow RecordBatches are retained between yields (RSS
+# growing into multiple GB on long filter-heavy runs) and because per-row
+# Python-side filtering is ~100× slower than pyarrow's batched column filter.
+#
+# This path downloads each parquet shard to a temp dir, scans it with
+# pyarrow's column-batch iterator, keeps only rows where language == "hy",
+# writes the plain_text field out, and deletes the shard before moving on.
+# Peak disk footprint: one parquet shard (~150-200 MB) + the growing
+# ccnews_hy.txt output file. Peak RAM per worker: ~50-100 MB (a pyarrow
+# batch is small and buffers are released cleanly).
+
+CCNEWS_YEARS = ("2023", "2024")
+
+
+# Scan-worker source code as a string. Embedded in the main module to
+# avoid a separate file / import / pickle dance. Run via
+# `python -c CCNEWS_SCAN_WORKER_SRC parquet_path out_path io_buffer`.
+# Writes one stats line to stdout: "OK docs chars scanned".
+CCNEWS_SCAN_WORKER_SRC = r"""
+import sys
+import pyarrow.parquet as pq
+import pyarrow.compute as pc
+
+parquet_path, out_path, io_buffer = sys.argv[1], sys.argv[2], int(sys.argv[3])
+docs = 0
+chars = 0
+scanned = 0
+try:
+    pf = pq.ParquetFile(parquet_path, pre_buffer=False, memory_map=False)
+    with open(out_path, "ab", buffering=io_buffer) as fout:
+        for batch in pf.iter_batches(
+            batch_size=10000,
+            columns=["plain_text", "language"],
+        ):
+            scanned += len(batch)
+            mask = pc.equal(batch.column("language"), "hy")
+            n_hy = pc.sum(mask).as_py() or 0
+            if n_hy == 0:
+                continue
+            filtered = batch.filter(mask)
+            for text in filtered.column("plain_text").to_pylist():
+                if not text:
+                    continue
+                t = text.strip()
+                if len(t) < 50:
+                    continue
+                b = t.encode("utf-8")
+                fout.write(b)
+                fout.write(b"\n\n")
+                chars += len(b) + 2
+                docs += 1
+except Exception as e:
+    print(f"ERR {e}", file=sys.stderr)
+    print(f"OK {docs} {chars} {scanned}", flush=True)
+    sys.exit(1)
+print(f"OK {docs} {chars} {scanned}", flush=True)
+"""
+
+
+def download_ccnews(max_parallel_downloads=8):
+    """Download CC-News 2023+2024 shards and extract Armenian rows.
+
+    Architecture (memory-safe across 110+ shards):
+      - Parent process manages a ThreadPoolExecutor to download parquet
+        shards from HuggingFace in parallel (network-bound, GIL releases
+        during I/O).
+      - As each shard completes downloading, the parent spawns a FRESH
+        subprocess (`python -c <inlined scan script>`) to scan it.
+        The subprocess imports pyarrow, reads the shard, filters by
+        language==hy, appends hy rows to ccnews_hy.txt, and exits.
+      - When the subprocess exits, its entire pyarrow/jemalloc memory
+        footprint is reclaimed by the OS. Parent process RSS stays
+        roughly constant at its baseline (~50-100 MB) regardless of
+        how many shards we process.
+      - Parquet shard files are deleted from the temp dir as soon as
+        their scan subprocess returns, so peak disk is bounded by
+        `max_parallel_downloads` shards in flight (~150 MB each).
+    """
+    import tempfile
+    import subprocess
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from huggingface_hub import HfApi, get_token
+
+    out_file = os.path.join(TEXT_TRAIN_DIR, "ccnews_hy.txt")
+    progress_file = os.path.join(TEXT_TRAIN_DIR, ".ccnews_progress")
+
+    # Resume-aware startup:
+    #   - If both ccnews_hy.txt AND .ccnews_progress exist, we're resuming
+    #     a previous run: load the set of already-processed shard names
+    #     and skip them this pass, appending new rows to the same output.
+    #   - If only one exists (or neither), that's an inconsistent/fresh
+    #     state → start from scratch.
+    done_shards = set()
+    if os.path.exists(out_file) and os.path.exists(progress_file):
+        with open(progress_file) as f:
+            done_shards = {line.strip() for line in f if line.strip()}
+        print(f"  CC-News resume: {len(done_shards)} shards already processed, "
+              f"existing output {os.path.getsize(out_file) / 1024 / 1024:.1f} MB",
+              flush=True)
+    else:
+        if os.path.exists(out_file):
+            os.remove(out_file)
+        if os.path.exists(progress_file):
+            os.remove(progress_file)
+        # Create an empty file so scan subprocesses can open it in "ab" mode.
+        open(out_file, "wb").close()
+        open(progress_file, "w").close()
+
+    token = os.environ.get("HF_TOKEN") or get_token()
+
+    api = HfApi(token=token)
+    all_files = api.list_repo_files(
+        "stanford-oval/ccnews", repo_type="dataset", token=token
+    )
+    all_targets = sorted(
+        f for f in all_files
+        if f.endswith(".parquet")
+        and any(f.startswith(f"{y}_") for y in CCNEWS_YEARS)
+    )
+    targets = [f for f in all_targets if f not in done_shards]
+    if done_shards:
+        print(f"  CC-News: {len(targets)} shards remaining "
+              f"({len(done_shards)} already done, {len(all_targets)} total)",
+              flush=True)
+    else:
+        print(f"  CC-News: {len(targets)} parquet shards to scan "
+              f"({'+'.join(CCNEWS_YEARS)})", flush=True)
+    if not targets:
+        return out_file
+
+    total_docs = 0
+    total_chars = 0
+    total_scanned = 0
+    t_start = time.time()
+
+    def _direct_fetch(fname, tmpdir):
+        """Direct HTTPS download via urllib — no HF library involvement.
+
+        hf_hub_download retains ~300-400 MB of parent-process state per
+        file (hash tracking, ref metadata, blob symlinks, etc.) even when
+        called with local_dir. urllib streams bytes straight from HTTPS
+        to disk and leaves no residual state, which is critical when
+        processing 110+ shards back-to-back.
+        """
+        import urllib.request
+        import urllib.error
+        url = (
+            f"https://huggingface.co/datasets/stanford-oval/ccnews/"
+            f"resolve/main/{fname}"
+        )
+        out_path = os.path.join(tmpdir, fname)
+        req = urllib.request.Request(url)
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        with urllib.request.urlopen(req, timeout=120) as resp, \
+             open(out_path, "wb") as f:
+            while True:
+                chunk = resp.read(4 * 1024 * 1024)  # 4 MB pipe chunks
+                if not chunk:
+                    break
+                f.write(chunk)
+        return out_path
+
+    with tempfile.TemporaryDirectory(dir=TEXT_TRAIN_DIR, prefix="ccnews_pq_") as tmpdir, \
+         ThreadPoolExecutor(max_workers=max_parallel_downloads) as pool:
+
+        futures = {pool.submit(_direct_fetch, f, tmpdir): f for f in targets}
+
+        for idx, future in enumerate(as_completed(futures), 1):
+            fname = futures[future]
+            try:
+                path = future.result()
+            except Exception as e:
+                print(f"  [{idx}/{len(targets)}] {fname}: download failed: {e}",
+                      flush=True)
+                continue
+
+            # Run the scan in a FRESH subprocess (python -c <inlined src>).
+            # When it exits, the OS reclaims all pyarrow memory pool state,
+            # which is the only reliable way to prevent multi-GB RSS
+            # retention across 110+ shards on macOS.
+            file_docs = 0
+            file_chars = 0
+            file_scanned = 0
+            try:
+                proc = subprocess.run(
+                    [
+                        sys.executable, "-c", CCNEWS_SCAN_WORKER_SRC,
+                        path, out_file, str(IO_BUFFER),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=900,
+                )
+                stdout = proc.stdout.strip()
+                last = stdout.rsplit("\n", 1)[-1] if stdout else ""
+                if last.startswith("OK "):
+                    _, d, c, s = last.split()
+                    file_docs = int(d)
+                    file_chars = int(c)
+                    file_scanned = int(s)
+                if proc.returncode != 0:
+                    err = proc.stderr.strip() or "unknown"
+                    print(
+                        f"  [{idx}/{len(targets)}] {fname}: scan subprocess "
+                        f"exit={proc.returncode}: {err[:200]}",
+                        flush=True,
+                    )
+            except subprocess.TimeoutExpired:
+                print(
+                    f"  [{idx}/{len(targets)}] {fname}: scan subprocess "
+                    f"timeout (>900s)",
+                    flush=True,
+                )
+            except Exception as e:
+                print(
+                    f"  [{idx}/{len(targets)}] {fname}: subprocess error: {e}",
+                    flush=True,
+                )
+
+            # Reclaim disk space — delete the shard immediately after scan.
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+            # Record the shard as done so a future run can resume.
+            try:
+                with open(progress_file, "a") as pf_:
+                    pf_.write(fname + "\n")
+                    pf_.flush()
+                    os.fsync(pf_.fileno())
+            except OSError:
+                pass
+
+            total_docs += file_docs
+            total_chars += file_chars
+            total_scanned += file_scanned
+            elapsed = time.time() - t_start
+            rate_mb = total_chars / elapsed / 1024 / 1024 if elapsed > 0 else 0
+            print(
+                f"  [{idx}/{len(targets)}] {fname}: +{file_docs} hy docs "
+                f"({file_chars / 1024:.0f} KB) | total {total_docs:,} docs, "
+                f"{total_chars / 1024 / 1024:.1f} MB, "
+                f"scanned {total_scanned / 1e6:.1f} M rows ({rate_mb:.2f} MB/s)",
+                flush=True,
+            )
+
+    elapsed = time.time() - t_start
+    print(f"  CC-News: {total_docs:,} hy docs, {total_chars:,} chars "
+          f"({total_chars / 1024 / 1024:.0f} MB) in {fmt_time(elapsed)}")
+    return out_file
+
+
+# -----------------------------------------------------------------------------
 # OpenSubtitles 2024 (HF, parallel corpus with src/tgt lang columns)
 # -----------------------------------------------------------------------------
 
@@ -638,9 +995,8 @@ def _download_hf_worker(args):
     """
     Worker function for parallel HF downloads.
     Runs in a separate process. Streams one dataset and writes to its
-    own intermediate text file. The parent process (orchestrator) is
-    responsible for appending the file into raw_text.txt and writing
-    the marker after the worker returns.
+    own text file ``{name}_hy.txt`` that the parent keeps on disk. The
+    parent writes the marker via _commit_source after the worker returns.
 
     args format (tuple):
         (name, dataset_id, lang_config, text_field, out_file, hf_token,
@@ -724,29 +1080,31 @@ def _download_hf_worker(args):
 
 
 def download_corpus(args):
-    """Download pretraining sources and stream-append each into raw_text.txt.
+    """Download pretraining sources. Each source is kept as its own file.
 
     Per-source lifecycle:
-        1. If marker `.{name}_done` exists → skip entirely.
-        2. Otherwise: download source → append to raw_text.txt → delete
-           intermediate → write marker.
+        1. If marker `.{name}_done` exists AND `{name}_hy.txt` is on disk
+           → skip entirely.
+        2. Otherwise: download source → write `{name}_hy.txt` → write marker.
 
-    Peak disk footprint = raw_text.txt + (intermediates of sources currently
-    in-flight). The wiki `.bz2` and cc100 `.xz` are deleted as soon as
-    their extracted text is committed.
+    No merging into a single `raw_text.txt`. Every source stays as its own
+    plain-text file so the tokenizer step (2_prepare.py) can iterate them
+    with provenance tags, and so you can regenerate or replace individual
+    sources cheaply without rebuilding the whole corpus.
 
     Source inventory:
-        Phase 1 direct downloads:
-            wiki     — Armenian Wikipedia (dump → extract)
-            cc100    — CC-100 Armenian (xz → decompress)
-            hplt3    — HPLT 3.0 Armenian (zstd shards via .map manifest)
-            arlis    — ARLIS legal corpus (jsonl.xz, HTML body → text)
-        Phase 2 HuggingFace streaming (parallel):
-            culturax — uonlp/CulturaX (hy)
-            mc4      — allenai/c4 (hy)
-            glot500  — cis-lmu/Glot500 (hye_Armn)
-            ccnews_2023, ccnews_2024 — stanford-oval/ccnews with lang filter
+        Phase 1 direct downloads (sequential):
+            wiki, wikisource, wiktionary, wikiquote — Wikimedia dumps
+            cc100  — CC-100 Armenian (xz → decompress)
+            hplt3  — HPLT 3.0 Armenian (zstd shards via .map manifest)
+            arlis  — ARLIS legal corpus (jsonl.xz, HTML body → text)
+            ccnews — Stanford CC-News, direct-parquet hy filter
             opensubtitles — Helsinki-NLP/OpenSubtitles2024 (gated, optional)
+        Phase 2 HuggingFace streaming (parallel):
+            culturax        — uonlp/CulturaX (hy)
+            mc4             — allenai/c4 (hy)
+            glot500         — cis-lmu/Glot500 (hye_Armn)
+            finetranslations — HuggingFaceFW/finetranslations (hye_Armn)
 
     HPLT 2.0 has been replaced by HPLT 3.0 — same pipeline, expanded time
     window (2012-2024), better extractor. OSCAR-2301 not included —
@@ -756,6 +1114,9 @@ def download_corpus(args):
 
     # Each HF source entry: dict with repo, config, text_field,
     # optional filter_field / filter_value for row-level filtering.
+    # Note: CC-News is NOT here — it uses the dedicated download_ccnews()
+    # direct-parquet path to avoid the datasets library's leaky streaming
+    # iterator on large filter-heavy scans.
     hf_sources = {
         "culturax": {
             "repo": "uonlp/CulturaX", "config": "hy", "text_field": "text",
@@ -766,15 +1127,15 @@ def download_corpus(args):
         "glot500": {
             "repo": "cis-lmu/Glot500", "config": "hye_Armn", "text_field": "text",
         },
-        "ccnews_2023": {
-            "repo": "stanford-oval/ccnews", "config": "2023",
-            "text_field": "plain_text",
-            "filter_field": "language", "filter_value": "hy",
-        },
-        "ccnews_2024": {
-            "repo": "stanford-oval/ccnews", "config": "2024",
-            "text_field": "plain_text",
-            "filter_field": "language", "filter_value": "hy",
+        # FineTranslations is a parallel Armenian↔English corpus where the
+        # Armenian side (`og_full_text`, og = "original") is the native
+        # CommonCrawl text filtered by the FineWeb2 pipeline. We pull only
+        # the Armenian column; the English `translated_text` field is
+        # discarded. ~943 M tokens of Trafilatura-cleaned Armenian web text.
+        "finetranslations": {
+            "repo": "HuggingFaceFW/finetranslations",
+            "config": "hye_Armn",
+            "text_field": "og_full_text",
         },
     }
 
@@ -790,19 +1151,15 @@ def download_corpus(args):
             hf_token = None
 
     print(f"{'='*60}")
-    print(f"  ArmGPT Corpus Download — Stream & Append Mode")
+    print(f"  ArmGPT Corpus Download — Per-Source Files Mode")
     print(f"{'='*60}")
-    print(f"  Output:     {RAW_FILE}")
+    print(f"  Output dir: {TEXT_TRAIN_DIR}")
     print(f"  HF cache:   {HF_CACHE_DIR}")
     print(f"  HF workers: {args.workers}")
     print(f"  HF auth:    {'token present' if hf_token else 'NONE (unauthenticated)'}")
     if skip:
         print(f"  Skipping:   {', '.join(skip)}")
     print(f"{'='*60}\n")
-
-    # Ensure raw_text.txt exists so the first "ab" open doesn't error.
-    if not os.path.exists(RAW_FILE):
-        open(RAW_FILE, "wb").close()
 
     t_start = time.time()
 
@@ -814,7 +1171,7 @@ def download_corpus(args):
     if "wiki" in skip:
         print("[SKIP] Wikipedia")
     elif _marker_exists("wiki"):
-        print("\n[WIKI] Already committed to raw_text.txt, skipping.")
+        print("\n[WIKI] Already downloaded (marker + file on disk), skipping.")
     else:
         print("\n[WIKI] Armenian Wikipedia (~1.5 GB)")
         wiki_file = download_wikipedia()
@@ -826,10 +1183,37 @@ def download_corpus(args):
             os.remove(DUMP_FILE)
             print(f"  Removed wiki dump ({dump_mb:.0f} MB)")
 
+    if "wikisource" in skip:
+        print("[SKIP] Wikisource")
+    elif _marker_exists("wikisource"):
+        print("\n[WIKISOURCE] Already downloaded (marker + file on disk), skipping.")
+    else:
+        print("\n[WIKISOURCE] Armenian Wikisource (classical literature, ~100 MB dump)")
+        wikisource_file = download_wikisource()
+        _commit_source("wikisource", wikisource_file)
+
+    if "wiktionary" in skip:
+        print("[SKIP] Wiktionary")
+    elif _marker_exists("wiktionary"):
+        print("\n[WIKTIONARY] Already downloaded (marker + file on disk), skipping.")
+    else:
+        print("\n[WIKTIONARY] Armenian Wiktionary (dictionary, ~40 MB dump)")
+        wiktionary_file = download_wiktionary()
+        _commit_source("wiktionary", wiktionary_file)
+
+    if "wikiquote" in skip:
+        print("[SKIP] Wikiquote")
+    elif _marker_exists("wikiquote"):
+        print("\n[WIKIQUOTE] Already downloaded (marker + file on disk), skipping.")
+    else:
+        print("\n[WIKIQUOTE] Armenian Wikiquote (quotations, ~3 MB dump)")
+        wikiquote_file = download_wikiquote()
+        _commit_source("wikiquote", wikiquote_file)
+
     if "cc100" in skip:
         print("[SKIP] CC-100")
     elif _marker_exists("cc100"):
-        print("\n[CC100] Already committed to raw_text.txt, skipping.")
+        print("\n[CC100] Already downloaded (marker + file on disk), skipping.")
     else:
         print("\n[CC100] CC-100 Armenian (~4.9 GB)")
         cc100_file = download_cc100()
@@ -838,7 +1222,7 @@ def download_corpus(args):
     if "hplt3" in skip:
         print("[SKIP] HPLT 3.0")
     elif _marker_exists("hplt3"):
-        print("\n[HPLT3] Already committed to raw_text.txt, skipping.")
+        print("\n[HPLT3] Already downloaded (marker + file on disk), skipping.")
     else:
         print("\n[HPLT3] HPLT 3.0 Armenian (~8.3 GB compressed, ~25 GB text)")
         hplt3_file = download_hplt3()
@@ -847,16 +1231,40 @@ def download_corpus(args):
     if "arlis" in skip:
         print("[SKIP] ARLIS")
     elif _marker_exists("arlis"):
-        print("\n[ARLIS] Already committed to raw_text.txt, skipping.")
+        print("\n[ARLIS] Already downloaded (marker + file on disk), skipping.")
     else:
         print("\n[ARLIS] Armenian legislation database (~508 MB compressed)")
         arlis_file = download_arlis()
         _commit_source("arlis", arlis_file)
 
+    if "ccnews" in skip:
+        print("[SKIP] CC-News")
+    elif _marker_exists("ccnews"):
+        print("\n[CCNEWS] Already downloaded (marker + file on disk), skipping.")
+    else:
+        print("\n[CCNEWS] Stanford CC-News 2023+2024 (direct parquet + pyarrow hy filter)")
+        try:
+            ccn_file = download_ccnews(max_parallel_downloads=8)
+            if os.path.exists(ccn_file) and os.path.getsize(ccn_file) > 0:
+                _commit_source("ccnews", ccn_file)
+                # Clean up the shard-level resume sidecar now that the
+                # full file is committed.
+                progress_file = os.path.join(TEXT_TRAIN_DIR, ".ccnews_progress")
+                if os.path.exists(progress_file):
+                    os.remove(progress_file)
+            else:
+                print("  CC-News: empty output, nothing to commit.")
+                if os.path.exists(ccn_file):
+                    os.remove(ccn_file)
+        except Exception as e:
+            print(f"  CC-News: ERROR {e}")
+            # Leave ccnews_hy.txt and .ccnews_progress in place — they
+            # represent resume state for the next run.
+
     if "opensubtitles" in skip:
         print("[SKIP] OpenSubtitles")
     elif _marker_exists("opensubtitles"):
-        print("\n[OPENSUBTITLES] Already committed to raw_text.txt, skipping.")
+        print("\n[OPENSUBTITLES] Already downloaded (marker + file on disk), skipping.")
     else:
         print("\n[OPENSUBTITLES] Helsinki-NLP/OpenSubtitles2024 (validation + test, hy filter)")
         try:
@@ -882,7 +1290,7 @@ def download_corpus(args):
         if name in skip:
             print(f"[SKIP] {name}")
         elif _marker_exists(name):
-            print(f"[{name.upper()}] Already committed to raw_text.txt, skipping.")
+            print(f"[{name.upper()}] Already downloaded (marker + file on disk), skipping.")
         else:
             hf_to_download[name] = cfg
 
@@ -943,8 +1351,9 @@ def download_corpus(args):
 
     clear_hf_cache()
 
-    # Only sweep stray .bz2 / .xz intermediates. Markers and raw_text.txt
-    # are preserved — markers are what lets a subsequent run skip work.
+    # Only sweep stray .bz2 / .xz dumps — the per-source {name}_hy.txt
+    # intermediates are KEPT on disk (they're the final output now,
+    # not temporary files). Markers are also kept so reruns skip cleanly.
     for f in os.listdir(TEXT_TRAIN_DIR):
         path = os.path.join(TEXT_TRAIN_DIR, f)
         if not os.path.isfile(path):
@@ -955,13 +1364,29 @@ def download_corpus(args):
             os.remove(path)
 
     elapsed = time.time() - t_start
-    final_size = get_file_size_mb(RAW_FILE)
+
+    # Inventory the per-source files left on disk and report totals.
+    source_files = sorted(
+        f for f in os.listdir(TEXT_TRAIN_DIR)
+        if f.endswith("_hy.txt")
+        and os.path.isfile(os.path.join(TEXT_TRAIN_DIR, f))
+    )
+    total_bytes = sum(
+        os.path.getsize(os.path.join(TEXT_TRAIN_DIR, f)) for f in source_files
+    )
+    total_gb = total_bytes / (1024 ** 3)
+
     print(f"\n{'='*60}")
     print(f"  Corpus Download Complete!")
     print(f"{'='*60}")
-    print(f"  raw_text.txt: {final_size:.0f} MB ({final_size / 1024:.1f} GB)")
-    print(f"  Total time:   {fmt_time(elapsed)}")
-    print(f"\n  Next step: python 2_prepare.py")
+    print(f"  Sources on disk: {len(source_files)} files in {TEXT_TRAIN_DIR}")
+    for f in source_files:
+        size_mb = os.path.getsize(os.path.join(TEXT_TRAIN_DIR, f)) / (1024 * 1024)
+        print(f"    {f:32s}  {size_mb:>8.0f} MB")
+    print(f"  Total corpus:    {total_bytes:,} bytes ({total_gb:.2f} GB)")
+    print(f"  Total time:      {fmt_time(elapsed)}")
+    print(f"\n  Next step: python 2_prepare.py  "
+          f"(tokenizer reads all {len(source_files)} source files at prep time)")
 
 
 # =============================================================================
@@ -1503,6 +1928,465 @@ def download_qa(args):
 
 
 # =============================================================================
+#                       HuggingFace publish / fetch
+# =============================================================================
+# Two-way door for the prepared corpus + Q&A bundle. Default repo is
+# `edisimon/armenian-clean-text`, overridable with --hf-repo.
+#
+# `--upload` packages the deduped clean_text.txt (from 2_prepare.py) as a
+# zstd-compressed file under `corpus/clean_text.txt.zst`, plus the raw
+# Q&A JSONs under `finetune/`, plus a generated README.md with full source
+# attribution and license notes. Before uploading it deletes any files in
+# the repo that aren't part of the new structure so the repo stays clean.
+#
+# `--download` pulls everything back, decompresses the corpus to
+# `data/text/train/clean_text.txt`, places the Q&A files under
+# `data/text/finetune/`, and writes a sentinel marker so `1_download.py`
+# reruns skip the full re-download path.
+
+DEFAULT_HF_DATASET_REPO = "edisimon/armenian-clean-text"
+
+HF_CORPUS_PATH = "corpus/clean_text.txt.zst"
+HF_FINETUNE_DIR = "finetune"
+
+# Source inventory used by _build_hf_readme. Keeps the README and the
+# actual source list in sync — add an entry here whenever a new source
+# is wired into download_corpus().
+_HF_README_SOURCES = [
+    ("Armenian Wikipedia (hywiki)",              "CC BY-SA 4.0",
+     "https://dumps.wikimedia.org/hywiki/"),
+    ("Armenian Wikisource (hywikisource)",       "CC BY-SA 4.0",
+     "https://dumps.wikimedia.org/hywikisource/"),
+    ("Armenian Wiktionary (hywiktionary)",       "CC BY-SA 4.0",
+     "https://dumps.wikimedia.org/hywiktionary/"),
+    ("Armenian Wikiquote (hywikiquote)",         "CC BY-SA 4.0",
+     "https://dumps.wikimedia.org/hywikiquote/"),
+    ("CC-100 Armenian",                           "Common Crawl Terms of Use",
+     "https://data.statmt.org/cc-100/hy.txt.xz"),
+    ("HPLT 3.0 Armenian (hye_Armn)",              "CC0 1.0",
+     "https://data.hplt-project.org/three/sorted/hye_Armn.map"),
+    ("CulturaX Armenian (uonlp/CulturaX)",       "ODC-By 1.0",
+     "https://huggingface.co/datasets/uonlp/CulturaX"),
+    ("mC4 Armenian (allenai/c4)",                 "ODC-By 1.0",
+     "https://huggingface.co/datasets/allenai/c4"),
+    ("Glot500 Armenian (cis-lmu/Glot500)",       "Research use (mixed)",
+     "https://huggingface.co/datasets/cis-lmu/Glot500"),
+    ("ARLIS Armenian legislation database",       "Public domain (HY gov)",
+     "https://data.opendata.am/dataset/arlis-db"),
+    ("Stanford CC-News (hy filter)",             "Common Crawl Terms of Use",
+     "https://huggingface.co/datasets/stanford-oval/ccnews"),
+    ("FineTranslations Armenian (hye_Armn)",     "ODC-By 1.0",
+     "https://huggingface.co/datasets/HuggingFaceFW/finetranslations"),
+]
+
+
+def _build_hf_readme(corpus_stats=None, qa_files=None):
+    """Render the README.md contents for the HF dataset repo.
+
+    Includes YAML front matter, source attribution, license notes, and
+    quick-start loading examples.
+    """
+    attribution = "\n".join(
+        f"- **{name}** — {lic}  \n  {url}"
+        for (name, lic, url) in _HF_README_SOURCES
+    )
+
+    corpus_block = ""
+    if corpus_stats:
+        corpus_block = (
+            "## Corpus statistics\n\n"
+            f"- Uncompressed size: **{corpus_stats.get('uncompressed_gb', '?'):.2f} GB**\n"
+            f"- Compressed size (zstd L19): **{corpus_stats.get('compressed_gb', '?'):.2f} GB**\n"
+            f"- Paragraphs: **{corpus_stats.get('paragraphs', 0):,}**\n"
+            f"- Sources: **12** (see list above)\n\n"
+            "Deduplicated at the paragraph level across all sources. "
+            "Quality-priority dedup order: Wikimedia → ARLIS → news → HPLT 3.0 → "
+            "CulturaX → FineTranslations → mC4 → CC-100.\n\n"
+        )
+
+    qa_block = ""
+    if qa_files:
+        qa_block = "## Fine-tuning Q&A files\n\n"
+        for fname, n_pairs in qa_files:
+            qa_block += f"- `finetune/{fname}` — {n_pairs:,} pairs\n"
+        qa_block += "\n"
+
+    return f"""---
+license: other
+license_name: mixed-source-attribution
+language:
+- hy
+pretty_name: Armenian Clean Corpus
+tags:
+- armenian
+- hy
+- hye_Armn
+- pretraining
+- text-corpus
+- sft
+size_categories:
+- 10B<n<100B
+---
+
+# Armenian Clean Corpus (pretraining + SFT bundle)
+
+Combined, deduplicated, cleaned Armenian text assembled for pretraining
+and supervised fine-tuning of small language models. Built via the
+pipeline at <https://github.com/EdikSimonian/armenian-gpt>:
+
+```
+python 1_download.py        # fetch sources
+python 2_prepare.py         # clean + dedup + merge
+python 1_download.py --upload   # push this bundle
+```
+
+## Contents
+
+```
+corpus/clean_text.txt.zst    zstd-compressed merged corpus
+finetune/*.json              SFT Q&A files (ArmBench, Aya hy slice,
+                             optional Qwen/Claude generated pairs)
+```
+
+{corpus_block}{qa_block}## Sources used
+
+{attribution}
+
+## License and attribution
+
+This dataset is assembled from multiple publicly available sources for
+text-and-data-mining research on low-resource language modeling.
+Wikimedia sources (Wikipedia / Wikisource / Wiktionary / Wikiquote) are
+CC BY-SA 4.0 — strict application of the ShareAlike clause would require
+this derivative work to also be CC BY-SA 4.0. The bundle is published
+under a mixed-source-attribution notice invoking the EU TDM exception
+(Directive 2019/790 Art. 4) and US fair use for ML research.
+
+Users are responsible for compliance with source license terms in their
+own jurisdiction. If you redistribute or fine-tune models on this data,
+please also preserve attribution to the upstream sources listed above.
+
+## Quick start
+
+Download the compressed corpus:
+
+```python
+from huggingface_hub import hf_hub_download
+import zstandard as zstd
+
+path = hf_hub_download(
+    repo_id="{DEFAULT_HF_DATASET_REPO}",
+    filename="{HF_CORPUS_PATH}",
+    repo_type="dataset",
+)
+
+# Decompress
+with open(path, "rb") as fin, open("clean_text.txt", "wb") as fout:
+    zstd.ZstdDecompressor().copy_stream(fin, fout)
+```
+
+Or reproduce via the pipeline:
+
+```bash
+git clone https://github.com/EdikSimonian/armenian-gpt.git
+cd armenian-gpt
+pip install -r requirements.txt
+python 1_download.py --download   # uses this HF dataset as source
+```
+"""
+
+
+def _compress_zstd(src_path, dst_path, level=12):
+    """Compress a file with zstd at the given level. Streams; bounded memory.
+
+    Default level is 12. Rationale:
+      * L3  (default):  ~500 MB/s, ~2.8× ratio
+      * L12 (sweet spot): ~60-100 MB/s per-core, ~3.4× ratio  ← used here
+      * L19 (ultra):    ~10 MB/s per-core, ~3.8× ratio
+    L12 gives ~90% of L19's compression at ~6× the throughput, which
+    matters a lot when the corpus is 60+ GB. With threads=-1 on a
+    10-core Mac this lands a 63 GB corpus in roughly 2-4 minutes.
+    """
+    import zstandard as zstd
+
+    cctx = zstd.ZstdCompressor(level=level, threads=-1)
+    total_in = os.path.getsize(src_path)
+    t0 = time.time()
+    with open(src_path, "rb") as fin, open(dst_path, "wb") as fout:
+        cctx.copy_stream(fin, fout, read_size=16 * 1024 * 1024,
+                         write_size=16 * 1024 * 1024)
+    total_out = os.path.getsize(dst_path)
+    elapsed = time.time() - t0
+    ratio = total_in / total_out if total_out else 0
+    print(f"  zstd L{level}: {total_in / 1024 ** 3:.2f} GB → "
+          f"{total_out / 1024 ** 3:.2f} GB "
+          f"({ratio:.1f}× ratio) in {fmt_time(elapsed)}")
+    return total_in, total_out
+
+
+def _decompress_zstd(src_path, dst_path):
+    """Decompress a zstd file to a plain output file (streaming)."""
+    import zstandard as zstd
+
+    dctx = zstd.ZstdDecompressor()
+    t0 = time.time()
+    with open(src_path, "rb") as fin, open(dst_path, "wb") as fout:
+        dctx.copy_stream(fin, fout, read_size=16 * 1024 * 1024,
+                         write_size=16 * 1024 * 1024)
+    total_out = os.path.getsize(dst_path)
+    elapsed = time.time() - t0
+    print(f"  unzstd: {os.path.getsize(src_path) / 1024 ** 3:.2f} GB → "
+          f"{total_out / 1024 ** 3:.2f} GB in {fmt_time(elapsed)}")
+
+
+def upload_dataset_to_hf(repo_id, corpus_path, finetune_dir, token=None):
+    """Upload the clean corpus + Q&A bundle to a HF dataset repo.
+
+    Layout written to the repo (existing unrelated files are deleted):
+        README.md
+        corpus/clean_text.txt.zst
+        finetune/*.json
+
+    Uses ``HfApi.upload_folder`` with ``delete_patterns=["*"]`` which tells
+    HF to remove any existing files not part of this upload. After upload
+    we run an LFS orphan sweep via ``permanently_delete_lfs_files`` to
+    reclaim storage quota from overwritten blobs.
+    """
+    import tempfile
+
+    from huggingface_hub import HfApi, get_token
+
+    if not os.path.exists(corpus_path):
+        print(f"Error: corpus file not found: {corpus_path}")
+        print("Run 'python 2_prepare.py' first to produce clean_text.txt.")
+        sys.exit(1)
+
+    if not os.path.isdir(finetune_dir):
+        print(f"Error: finetune dir not found: {finetune_dir}")
+        sys.exit(1)
+
+    token = token or os.environ.get("HF_TOKEN") or get_token()
+    if not token:
+        print("Error: no HF_TOKEN found — run 'hf auth login' first.")
+        sys.exit(1)
+
+    api = HfApi(token=token)
+
+    # Enumerate Q&A files that will be uploaded (JSONs only, skip sidecars).
+    qa_files = []
+    for f in sorted(os.listdir(finetune_dir)):
+        if not f.endswith(".json"):
+            continue
+        if f.endswith("_progress.json"):
+            continue  # skip generator-side resume state
+        qa_files.append(f)
+
+    if not qa_files:
+        print(f"Warning: no .json Q&A files under {finetune_dir}")
+
+    # Count pairs in each QA file for README stats.
+    qa_summary = []
+    for f in qa_files:
+        p = os.path.join(finetune_dir, f)
+        try:
+            with open(p) as fh:
+                data = json.load(fh)
+            n = len(data) if isinstance(data, list) else 0
+        except Exception:
+            n = 0
+        qa_summary.append((f, n))
+
+    # Stage everything in a tempdir so the upload is a single atomic folder.
+    with tempfile.TemporaryDirectory(prefix="armgpt-hf-upload-") as staging:
+        stage_corpus = os.path.join(staging, "corpus")
+        stage_finetune = os.path.join(staging, "finetune")
+        os.makedirs(stage_corpus, exist_ok=True)
+        os.makedirs(stage_finetune, exist_ok=True)
+
+        # Compress corpus
+        print(f"\n{'='*60}")
+        print(f"  Step 1/3: Compressing corpus")
+        print(f"{'='*60}")
+        out_zst = os.path.join(stage_corpus, "clean_text.txt.zst")
+        raw_size, zst_size = _compress_zstd(corpus_path, out_zst, level=12)
+
+        # Copy QA files
+        print(f"\n{'='*60}")
+        print(f"  Step 2/3: Staging Q&A files ({len(qa_files)})")
+        print(f"{'='*60}")
+        for f in qa_files:
+            shutil.copy2(os.path.join(finetune_dir, f),
+                         os.path.join(stage_finetune, f))
+            print(f"  {f}")
+
+        # Paragraph count from clean_stats.json (if exists) for the README
+        paragraphs = 0
+        stats_path = os.path.join(os.path.dirname(corpus_path), "clean_stats.json")
+        if os.path.exists(stats_path):
+            try:
+                with open(stats_path) as f:
+                    stats = json.load(f)
+                paragraphs = stats.get("totals", {}).get("kept_paragraphs", 0)
+            except Exception:
+                pass
+
+        readme = _build_hf_readme(
+            corpus_stats={
+                "uncompressed_gb": raw_size / 1024 ** 3,
+                "compressed_gb": zst_size / 1024 ** 3,
+                "paragraphs": paragraphs,
+            },
+            qa_files=qa_summary,
+        )
+        with open(os.path.join(staging, "README.md"), "w") as f:
+            f.write(readme)
+
+        # Nuke + recreate the repo. HF's private-repo LFS quota counts the
+        # new upload against the limit BEFORE deleting old files, so a
+        # simple `delete_patterns=["*"]` sync fails with a 403 once the
+        # combined old+new exceeds quota. Delete-then-create is the only
+        # reliable way to start from a known-clean slate.
+        try:
+            api.repo_info(repo_id=repo_id, repo_type="dataset")
+            print(f"\nDeleting existing repo {repo_id} to free quota...")
+            api.delete_repo(repo_id=repo_id, repo_type="dataset")
+            print(f"  Deleted {repo_id}")
+            # Small delay to let HF's quota accounting catch up before recreate
+            time.sleep(3)
+        except Exception as e:
+            # Not found is fine — we'll create fresh
+            print(f"  No existing repo to delete: {e}")
+
+        print(f"Creating fresh dataset repo: {repo_id}")
+        api.create_repo(repo_id=repo_id, repo_type="dataset",
+                        private=True, exist_ok=True)
+
+        print(f"\n{'='*60}")
+        print(f"  Step 3/3: Uploading to {repo_id}")
+        print(f"{'='*60}")
+        print(f"  Staged contents: {staging}")
+        print()
+        t0 = time.time()
+        commit_msg = (f"Upload corpus + Q&A bundle "
+                      f"(corpus {zst_size / 1024 ** 3:.1f} GB compressed, "
+                      f"{len(qa_files)} Q&A files)")
+        api.upload_folder(
+            folder_path=staging,
+            repo_id=repo_id,
+            repo_type="dataset",
+            commit_message=commit_msg,
+        )
+        elapsed = time.time() - t0
+        print(f"  Upload complete in {fmt_time(elapsed)}")
+
+    # Reclaim LFS orphan quota after the sync
+    print(f"\n{'='*60}")
+    print(f"  Post-upload: sweeping LFS orphans")
+    print(f"{'='*60}")
+    try:
+        _lfs_orphan_cleanup(api, repo_id)
+    except Exception as e:
+        print(f"  LFS orphan cleanup skipped: {e}")
+
+    print(f"\n{'='*60}")
+    print(f"  Done → https://huggingface.co/datasets/{repo_id}")
+    print(f"{'='*60}")
+
+
+def _lfs_orphan_cleanup(api, repo_id):
+    """Permanently delete LFS blobs not referenced in the current tree."""
+    lfs_files = list(api.list_lfs_files(repo_id=repo_id, repo_type="dataset"))
+    referenced = set(api.list_repo_files(repo_id, repo_type="dataset"))
+    orphans = [f for f in lfs_files if f.filename not in referenced]
+    if not orphans:
+        print("  No orphaned LFS blobs.")
+        return
+    size_gb = sum(f.size for f in orphans) / 1024 ** 3
+    print(f"  Freeing {size_gb:.2f} GB across {len(orphans)} orphan LFS blobs...")
+    api.permanently_delete_lfs_files(
+        repo_id=repo_id, repo_type="dataset", lfs_files=orphans,
+    )
+    print(f"  Done.")
+
+
+def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None):
+    """Fetch the published corpus + Q&A bundle back into data/text/{train,finetune}/.
+
+    This is the counterpart to ``--upload``: reconstructs the local
+    layout exactly as ``2_prepare.py`` would leave it, so downstream
+    steps (3_tokenize.py, training) run unchanged.
+    """
+    from huggingface_hub import HfApi, hf_hub_download, get_token
+
+    token = token or os.environ.get("HF_TOKEN") or get_token()
+    if not token:
+        print("Error: no HF_TOKEN found — run 'hf auth login' first.")
+        sys.exit(1)
+
+    os.makedirs(train_dir, exist_ok=True)
+    os.makedirs(finetune_dir, exist_ok=True)
+
+    print(f"\n{'='*60}")
+    print(f"  Step 1/3: Fetching corpus from {repo_id}")
+    print(f"{'='*60}")
+    try:
+        zst_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=HF_CORPUS_PATH,
+            repo_type="dataset",
+            token=token,
+            cache_dir=HF_CACHE_DIR,
+        )
+    except Exception as e:
+        print(f"Error fetching {HF_CORPUS_PATH}: {e}")
+        print(f"Check that the repo exists and has been populated via --upload.")
+        sys.exit(1)
+
+    print(f"  Downloaded: {zst_path}")
+
+    print(f"\n{'='*60}")
+    print(f"  Step 2/3: Decompressing → {train_dir}/clean_text.txt")
+    print(f"{'='*60}")
+    clean_out = os.path.join(train_dir, "clean_text.txt")
+    _decompress_zstd(zst_path, clean_out)
+
+    # Fetch Q&A files
+    print(f"\n{'='*60}")
+    print(f"  Step 3/3: Fetching Q&A files")
+    print(f"{'='*60}")
+    api = HfApi(token=token)
+    all_files = api.list_repo_files(repo_id, repo_type="dataset", token=token)
+    qa_files = [
+        f for f in all_files
+        if f.startswith(f"{HF_FINETUNE_DIR}/") and f.endswith(".json")
+    ]
+    for hf_path in qa_files:
+        local_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=hf_path,
+            repo_type="dataset",
+            token=token,
+            cache_dir=HF_CACHE_DIR,
+        )
+        target = os.path.join(finetune_dir, os.path.basename(hf_path))
+        shutil.copy2(local_path, target)
+        print(f"  {os.path.basename(hf_path)}")
+
+    # Write a sentinel so reruns of 1_download.py know everything was
+    # fetched from HF and nothing needs re-downloading from source.
+    with open(os.path.join(train_dir, ".downloaded_from_hf"), "w") as f:
+        f.write(f"{repo_id}\n")
+
+    print(f"\n{'='*60}")
+    print(f"  Done")
+    print(f"{'='*60}")
+    print(f"  Corpus:   {clean_out}")
+    print(f"  Q&A dir:  {finetune_dir}")
+    print()
+    print(f"  Next step: python 3_tokenize.py --tokenizer bpe")
+
+
+# =============================================================================
 #                                    Main
 # =============================================================================
 
@@ -1513,12 +2397,40 @@ def main():
     parser.add_argument("--qa", action="store_true",
                         help="Download SFT Q&A sources (ArmBench + Aya) instead of raw corpus")
     parser.add_argument("--skip", nargs="*", default=[],
-                        help="Sources to skip. Corpus: wiki cc100 hplt3 arlis opensubtitles "
-                             "culturax mc4 glot500 ccnews_2023 ccnews_2024. "
-                             "QA: armbench aya")
+                        help="Sources to skip. Corpus: wiki wikisource wiktionary wikiquote "
+                             "cc100 hplt3 arlis ccnews opensubtitles culturax mc4 glot500 "
+                             "finetranslations. QA: armbench aya")
     parser.add_argument("--workers", type=int, default=5,
                         help="Max parallel HF downloads (corpus mode only; default: 5)")
+
+    # HF publish / fetch
+    parser.add_argument("--upload", action="store_true",
+                        help="Package clean_text.txt + Q&A files and push to HF "
+                             f"(default repo: {DEFAULT_HF_DATASET_REPO})")
+    parser.add_argument("--download", action="store_true",
+                        help="Fetch the published corpus + Q&A from HF instead of "
+                             "running the full source-download pipeline")
+    parser.add_argument("--hf-repo", type=str, default=DEFAULT_HF_DATASET_REPO,
+                        help="Override the HF dataset repo for --upload/--download")
+
     args = parser.parse_args()
+
+    # --upload / --download short-circuit before any other mode
+    if args.upload:
+        upload_dataset_to_hf(
+            repo_id=args.hf_repo,
+            corpus_path=os.path.join(TEXT_TRAIN_DIR, "clean_text.txt"),
+            finetune_dir=TEXT_FINETUNE_DIR,
+        )
+        return
+
+    if args.download:
+        download_dataset_from_hf(
+            repo_id=args.hf_repo,
+            train_dir=TEXT_TRAIN_DIR,
+            finetune_dir=TEXT_FINETUNE_DIR,
+        )
+        return
 
     if args.qa:
         download_qa(args)
