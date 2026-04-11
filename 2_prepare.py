@@ -1,18 +1,24 @@
 """
-Step 2: Clean raw Armenian text.
+Step 2: Prepare the data for tokenization.
 
-Reads data/raw_text.txt (produced by 1_download.py) and writes a cleaned
-version to data/clean_text.txt. Cleaning keeps only Armenian letters,
-ASCII punctuation, digits, and whitespace, and normalizes Unicode to NFC.
+Default mode (corpus): Cleans data/raw_text.txt (produced by 1_download.py)
+and writes a normalized version to data/clean_text.txt. Cleaning keeps only
+Armenian letters, ASCII punctuation, digits, and whitespace (NFC normalized).
 
 Memory-safe: processes text in parallel segments, each worker handling its
 segment in 50 MB chunks. Safe for 20+ GB inputs.
 
-Usage:
-    python 2_prepare.py
+--qa mode: Merges the SFT JSON files produced by 1_download.py --qa
+(armbench_{train,eval}.json + aya_armenian.json + optional
+armenian_qa.json) into a single deduplicated data/qa_merged.json.
 
-After running, you'll have:
-    data/clean_text.txt  — normalized Armenian-only text ready for 3_tokenize.py
+Usage:
+    python 2_prepare.py           # corpus mode
+    python 2_prepare.py --qa      # Q&A mode
+
+Outputs:
+    corpus: data/clean_text.txt
+    qa:     data/qa_merged.json
 """
 
 import os
@@ -121,7 +127,7 @@ def clean_file_chunked(input_path, output_path):
     return out_chars
 
 
-def main():
+def prepare_corpus():
     if not os.path.exists(RAW_FILE):
         print(f"Error: {RAW_FILE} not found!")
         print("Run 'python 1_download.py' first to download the data.")
@@ -150,6 +156,51 @@ def main():
     print(f"  {CLEAN_FILE}: {clean_size / 1024 / 1024:.0f} MB")
     print(f"{'='*50}")
     print("Next step: python 3_tokenize.py --tokenizer bpe")
+
+
+def prepare_qa():
+    """Merge the SFT source JSONs into data/qa_merged.json."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from data.merge_sft_sources import merge_sft_sources
+
+    # Inputs in priority order — earlier sources win dedup ties.
+    # armenian_qa.json is only present if the user ran the optional Claude
+    # generator (data/generate_armenian_qa.py); it's merged in first so its
+    # hand-crafted pairs take priority over the larger translated sets.
+    input_paths = [
+        os.path.join(DATA_DIR, "armenian_qa.json"),    # optional, from Claude
+        os.path.join(DATA_DIR, "armbench_train.json"), # native exam QA
+        os.path.join(DATA_DIR, "aya_armenian.json"),   # filtered Aya
+    ]
+    output_path = os.path.join(DATA_DIR, "qa_merged.json")
+
+    print(f"\n{'='*50}")
+    print(f"  Step 2: Merge SFT sources (--qa)")
+    print(f"{'='*50}")
+
+    n = merge_sft_sources(input_paths, output_path)
+    if n == 0:
+        print(f"\nError: no Q&A sources found in {DATA_DIR}.")
+        print("Run 'python 1_download.py --qa' first.")
+        sys.exit(1)
+
+    print(f"\n{'='*50}")
+    print(f"  Step 2 (--qa) complete: {n:,} unique pairs")
+    print(f"{'='*50}")
+    print("Next step: python 3_tokenize.py --qa --tokenizer bpe")
+
+
+def main():
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--qa", action="store_true",
+                        help="Merge SFT Q&A JSON files instead of cleaning raw text")
+    args = parser.parse_args()
+
+    if args.qa:
+        prepare_qa()
+    else:
+        prepare_corpus()
 
 
 if __name__ == "__main__":

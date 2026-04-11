@@ -44,23 +44,6 @@ BLOCKLIST = [
 ]
 
 
-def download_alpaca_armenian():
-    """Download the Alpaca-Armenian dataset from HuggingFace."""
-    try:
-        from datasets import load_dataset
-    except ImportError:
-        print("Error: 'datasets' library not installed!")
-        print("Install it with: pip install datasets")
-        sys.exit(1)
-
-    print("Downloading Alpaca-Armenian dataset from HuggingFace...")
-    print("  Dataset: saillab/alpaca-armenian-cleaned")
-    ds = load_dataset("saillab/alpaca-armenian-cleaned")
-    print(f"  Train examples: {len(ds['train']):,}")
-    print(f"  Test examples:  {len(ds['test']):,}")
-    return ds
-
-
 def is_appropriate(example):
     """Filter out content not suitable for students ages 12-18."""
     text = (example.get("instruction", "") + " " +
@@ -104,80 +87,51 @@ def load_local_json(path: str) -> list:
     return examples
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--source", type=str, default=None,
-                        help="Path to pre-generated JSON file (e.g. data/armenian_qa.json). "
-                             "If omitted, downloads Alpaca-Armenian from HuggingFace.")
-    parser.add_argument("--tokenizer", type=str, default=None,
-                        choices=["char", "bpe"],
-                        help="Stage 1 tokenizer type. If omitted, auto-detects from data/.")
-    args = parser.parse_args()
+def prepare_chat_data(source_path, tokenizer_type):
+    """Build data_chat/ bins from a local SFT JSON using Stage 1 tokenizer.
 
-    # Resolve the Stage 1 tokenizer type (explicit or auto-detect).
+    source_path: path to a {instruction, input?, output} JSON file.
+    tokenizer_type: "char" or "bpe" — must match what was used in 3_tokenize.py.
+    """
     from tokenizers import (
         bin_paths,
-        detect_tokenizer_type,
         load_tokenizer as _load_tokenizer,
         tokenizer_path,
     )
-    if args.tokenizer:
-        tok_type = args.tokenizer
-    else:
-        try:
-            tok_type = detect_tokenizer_type(DATA_DIR)
-        except (FileNotFoundError, ValueError) as e:
-            print(f"\nError: {e}")
-            sys.exit(1)
 
-    # Step 1: Create output directory
     os.makedirs(CHAT_DIR, exist_ok=True)
 
-    # Step 2: Load dataset (local file or HuggingFace)
-    if args.source:
-        source_path = args.source
-        if not os.path.isabs(source_path):
-            source_path = os.path.join(os.path.dirname(DATA_DIR), source_path)
-        all_examples = load_local_json(source_path)
-    else:
-        ds = download_alpaca_armenian()
-        all_examples = list(ds["train"]) + list(ds["test"])
-        print(f"\nTotal examples: {len(all_examples):,}")
+    all_examples = load_local_json(source_path)
 
-    # Step 3: Filter
     print("Filtering inappropriate content...")
     filtered = [ex for ex in all_examples if is_appropriate(ex)]
     print(f"  After filtering: {len(filtered):,} examples "
           f"({len(all_examples) - len(filtered)} removed)")
 
-    # Step 4: Format as chat conversations
     print("Formatting as chat conversations...")
     formatted = [format_chat(ex) for ex in filtered]
-
-    # Join all conversations into one long text
     text = "\n".join(formatted)
     print(f"  Total text: {len(text):,} characters")
 
-    # Step 5: Load Stage 1 tokenizer and extend with special tokens
-    stage1_tok_path = tokenizer_path(DATA_DIR, tok_type)
+    # Load Stage 1 tokenizer
+    stage1_tok_path = tokenizer_path(DATA_DIR, tokenizer_type)
     if not os.path.exists(stage1_tok_path):
         print(f"\nError: {stage1_tok_path} not found!")
         print("Run Stage 1 data preparation first:")
-        print("  python data/download_all.py")
-        print(f"  python data/prepare.py --tokenizer {tok_type}")
+        print("  python 1_download.py")
+        print("  python 2_prepare.py")
+        print(f"  python 3_tokenize.py --tokenizer {tokenizer_type}")
         sys.exit(1)
 
-    tokenizer = _load_tokenizer(DATA_DIR, tok_type)
-
+    tokenizer = _load_tokenizer(DATA_DIR, tokenizer_type)
     old_vocab_size = tokenizer.vocab_size
-    print(f"\nStage 1 vocabulary: {old_vocab_size} tokens (type: {tok_type})")
+    print(f"\nStage 1 vocabulary: {old_vocab_size} tokens (type: {tokenizer_type})")
 
-    # Add special chat tokens
     tokenizer.add_special_tokens([USER_TOKEN, ASSISTANT_TOKEN, END_TOKEN])
-    print(f"Extended vocabulary: {tokenizer.vocab_size} tokens (+{tokenizer.vocab_size - old_vocab_size} special)")
+    print(f"Extended vocabulary: {tokenizer.vocab_size} tokens "
+          f"(+{tokenizer.vocab_size - old_vocab_size} special)")
 
-    # For char tokenizer, also add new characters from Alpaca data
-    if tok_type == "char":
+    if tokenizer_type == "char":
         new_chars = set()
         for ch in text:
             if ch not in tokenizer.stoi and len(ch) == 1:
@@ -186,29 +140,25 @@ def main():
             for ch in sorted(new_chars):
                 tokenizer.stoi[ch] = len(tokenizer.itos)
                 tokenizer.itos.append(ch)
-            print(f"  Added {len(new_chars)} new characters from Alpaca data")
+            print(f"  Added {len(new_chars)} new characters from chat data")
             print(f"  Final vocabulary: {tokenizer.vocab_size} tokens")
 
-    # Step 6: Encode the text
     print("Encoding text...")
     token_ids = tokenizer.encode(text)
     token_ids = np.array(token_ids, dtype=np.uint16)
     print(f"  Total tokens: {len(token_ids):,}")
 
-    # Step 7: Split into train and validation (90/10)
     split_idx = int(len(token_ids) * 0.9)
     train_ids = token_ids[:split_idx]
     val_ids = token_ids[split_idx:]
 
-    # Step 8: Save everything (suffixed so char and BPE can coexist)
-    train_path, val_path = bin_paths(CHAT_DIR, tok_type)
-    tok_path = tokenizer_path(CHAT_DIR, tok_type)
+    train_path, val_path = bin_paths(CHAT_DIR, tokenizer_type)
+    tok_path = tokenizer_path(CHAT_DIR, tokenizer_type)
 
     train_ids.tofile(train_path)
     val_ids.tofile(val_path)
     tokenizer.save(tok_path)
 
-    # Print summary
     print(f"\n{'='*50}")
     print(f"  Chat Data Preparation Complete!")
     print(f"{'='*50}")
@@ -220,26 +170,34 @@ def main():
     print(f"  Val size:     {os.path.getsize(val_path) / 1024 / 1024:.1f} MB")
     print(f"  Tokenizer:    {tok_path}")
 
-    # Show special token IDs
-    print(f"\nSpecial tokens:")
-    for tok in [USER_TOKEN, ASSISTANT_TOKEN, END_TOKEN]:
-        tok_id = tokenizer.encode(tok)
-        print(f"  {tok:15s} -> {tok_id}")
+    return len(filtered), len(train_ids), len(val_ids)
 
-    # Show a sample
-    sample_text = formatted[0][:200]
-    sample_ids = tokenizer.encode(sample_text)
-    decoded = tokenizer.decode(sample_ids)
-    print(f"\nSample conversation:")
-    try:
-        print(f"  {sample_text[:150]}...")
-    except UnicodeEncodeError:
-        print(f"  {sample_text[:150].encode('utf-8', errors='replace')}...")
-    print(f"\nRound-trip test: {'PASS' if sample_text == decoded else 'FAIL'}")
 
-    source_label = args.source if args.source else "HuggingFace (Alpaca-Armenian)"
-    print(f"  Source:       {source_label}")
-    print(f"\nNext step: python finetune.py")
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--source", type=str, required=True,
+                        help="Path to pre-generated JSON file (e.g. data/qa_merged.json).")
+    parser.add_argument("--tokenizer", type=str, default=None,
+                        choices=["char", "bpe"],
+                        help="Stage 1 tokenizer type. If omitted, auto-detects from data/.")
+    args = parser.parse_args()
+
+    from tokenizers import detect_tokenizer_type
+
+    if args.tokenizer:
+        tok_type = args.tokenizer
+    else:
+        try:
+            tok_type = detect_tokenizer_type(DATA_DIR)
+        except (FileNotFoundError, ValueError) as e:
+            print(f"\nError: {e}")
+            sys.exit(1)
+
+    source_path = args.source
+    if not os.path.isabs(source_path):
+        source_path = os.path.join(os.path.dirname(DATA_DIR), source_path)
+
+    prepare_chat_data(source_path, tok_type)
 
 
 if __name__ == "__main__":

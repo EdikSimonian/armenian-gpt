@@ -340,17 +340,10 @@ def merge_files(file_list, output_path):
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Corpus download (default mode)
 # ---------------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(description="Download all Armenian text data")
-    parser.add_argument("--skip", nargs="*", default=[],
-                        help="Sources to skip (e.g. --skip wiki cc100)")
-    parser.add_argument("--workers", type=int, default=5,
-                        help="Max parallel HF downloads (default: 5)")
-    args = parser.parse_args()
-
+def download_corpus(args):
     skip = set(s.lower() for s in args.skip)
 
     # HuggingFace sources — all downloaded in parallel
@@ -490,6 +483,77 @@ def main():
     print(f"  raw_text.txt: {final_size:.0f} MB ({final_size / 1024:.1f} GB)")
     print(f"  Total time:   {fmt_time(elapsed)}")
     print(f"\n  Next step: python 2_prepare.py")
+
+
+# ---------------------------------------------------------------------------
+# Q&A download (--qa mode)
+# ---------------------------------------------------------------------------
+
+def download_qa(args):
+    """Fetch all SFT source JSONs into data/ for later merging + tokenizing."""
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from data.fetch_armbench import fetch_armbench_qa
+    from data.fetch_aya_armenian import fetch_aya_qa
+
+    skip = set(s.lower() for s in args.skip)
+
+    print(f"{'='*60}")
+    print(f"  ArmGPT Q&A Download (SFT sources)")
+    print(f"{'='*60}")
+    print(f"  Output dir: {DATA_DIR}")
+    if skip:
+        print(f"  Skipping: {', '.join(skip)}")
+    print(f"{'='*60}\n")
+
+    t_start = time.time()
+
+    if "armbench" not in skip:
+        print("[ARMBENCH] Native Armenian exam + civics QA")
+        fetch_armbench_qa(
+            train_output_path=os.path.join(DATA_DIR, "armbench_train.json"),
+            eval_output_path=os.path.join(DATA_DIR, "armbench_eval.json"),
+        )
+    else:
+        print("[SKIP] ArmBench")
+
+    if "aya" not in skip:
+        print("\n[AYA] Filtered Armenian slice of Aya collection")
+        fetch_aya_qa(
+            output_path=os.path.join(DATA_DIR, "aya_armenian.json"),
+        )
+    else:
+        print("[SKIP] Aya")
+
+    elapsed = time.time() - t_start
+    print(f"\n{'='*60}")
+    print(f"  Q&A Download Complete!  ({fmt_time(elapsed)})")
+    print(f"{'='*60}")
+    print(f"  Optional: also run data/generate_armenian_qa.py to add")
+    print(f"            Claude-generated pairs to data/armenian_qa.json")
+    print(f"\n  Next step: python 2_prepare.py --qa")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Download Armenian text data (corpus by default, or --qa for SFT sources)"
+    )
+    parser.add_argument("--qa", action="store_true",
+                        help="Download SFT Q&A sources (ArmBench + Aya) instead of raw corpus")
+    parser.add_argument("--skip", nargs="*", default=[],
+                        help="Sources to skip. Corpus: wiki cc100 culturax oscar mc4 hplt glot500. "
+                             "QA: armbench aya")
+    parser.add_argument("--workers", type=int, default=5,
+                        help="Max parallel HF downloads (corpus mode only; default: 5)")
+    args = parser.parse_args()
+
+    if args.qa:
+        download_qa(args)
+    else:
+        download_corpus(args)
 
 
 if __name__ == "__main__":

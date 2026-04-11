@@ -1,23 +1,33 @@
 """
-Step 3: Train a tokenizer and encode the cleaned text to binary files.
+Step 3: Tokenize the prepared data.
 
-Reads data/clean_text.txt (produced by 2_prepare.py), trains either a
-character-level or BPE (SentencePiece) tokenizer, and writes the encoded
-corpus as a 90/10 train/val split.
+Default mode (corpus): Reads data/clean_text.txt (produced by 2_prepare.py),
+trains either a character-level or BPE (SentencePiece) tokenizer, and writes
+the encoded corpus as a 90/10 train/val split.
 
-Outputs for --tokenizer char:
+--qa mode: Reads data/qa_merged.json (produced by 2_prepare.py --qa), loads
+the Stage 1 tokenizer from data/tokenizer_{type}.json, extends it with chat
+special tokens (<|user|>, <|assistant|>, <|end|>), and writes the chat-
+formatted conversations as train/val bins under data_chat/.
+
+Outputs (corpus mode, --tokenizer char):
     data/train_char.bin, data/val_char.bin, data/tokenizer_char.json
 
-Outputs for --tokenizer bpe:
+Outputs (corpus mode, --tokenizer bpe):
     data/train_bpe.bin, data/val_bpe.bin, data/tokenizer_bpe.json
     (also data/bpe_model.{model,vocab} from SentencePiece training)
 
-The two tokenizer outputs use disjoint filenames so they coexist on disk —
-running this script with one tokenizer does not clobber the other's output.
+Outputs (--qa mode):
+    data_chat/train_{char,bpe}.bin
+    data_chat/val_{char,bpe}.bin
+    data_chat/tokenizer_{char,bpe}.json
+
+Char and BPE outputs use disjoint filenames so they coexist on disk.
 
 Usage:
-    python 3_tokenize.py --tokenizer bpe
-    python 3_tokenize.py --tokenizer char
+    python 3_tokenize.py --tokenizer bpe              # corpus mode
+    python 3_tokenize.py --tokenizer char             # corpus mode
+    python 3_tokenize.py --qa --tokenizer bpe         # chat mode
 """
 
 import os
@@ -212,13 +222,7 @@ def split_bin_file(all_tokens_path, train_path, val_path, val_ratio=0.1):
     print(f"  Val:   {os.path.getsize(val_path) / 1024 / 1024:.1f} MB")
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--tokenizer", type=str, required=True,
-                        choices=["char", "bpe"],
-                        help="Tokenizer type: 'char' (Level 1) or 'bpe' (Level 2)")
-    args = parser.parse_args()
-
+def tokenize_corpus(tokenizer_type):
     if not os.path.exists(CLEAN_FILE):
         print(f"Error: {CLEAN_FILE} not found!")
         print("Run 'python 2_prepare.py' first to clean the data.")
@@ -229,13 +233,13 @@ def main():
     print(f"  Step 3: Train tokenizer and encode")
     print(f"{'='*50}")
     print(f"  Input:     {CLEAN_FILE} ({clean_size / 1024 / 1024:.0f} MB)")
-    print(f"  Tokenizer: {args.tokenizer}")
+    print(f"  Tokenizer: {tokenizer_type}")
     print(f"{'='*50}\n")
 
     print("Step 3a: Building tokenizer...")
     all_tokens_path = os.path.join(DATA_DIR, "all_tokens.bin")
 
-    if args.tokenizer == "char":
+    if tokenizer_type == "char":
         tokenizer = build_char_vocab(CLEAN_FILE)
         print(f"  Vocabulary: {tokenizer.vocab_size} characters")
 
@@ -254,22 +258,60 @@ def main():
 
     print("\nStep 3c: Splitting train/val (90/10)...")
     from tokenizers import bin_paths, tokenizer_path
-    train_path, val_path = bin_paths(DATA_DIR, args.tokenizer)
+    train_path, val_path = bin_paths(DATA_DIR, tokenizer_type)
     split_bin_file(all_tokens_path, train_path, val_path)
 
     os.remove(all_tokens_path)
 
-    tok_path = tokenizer_path(DATA_DIR, args.tokenizer)
+    tok_path = tokenizer_path(DATA_DIR, tokenizer_type)
     tokenizer.save(tok_path)
 
     print(f"\n{'='*50}")
     print(f"  Step 3 complete")
     print(f"{'='*50}")
-    print(f"  Tokenizer:    {args.tokenizer} ({tokenizer.vocab_size} tokens)")
+    print(f"  Tokenizer:    {tokenizer_type} ({tokenizer.vocab_size} tokens)")
     print(f"  Train tokens: {os.path.getsize(train_path) // 2:,} ({train_path})")
     print(f"  Val tokens:   {os.path.getsize(val_path) // 2:,} ({val_path})")
     print(f"  Tokenizer:    {tok_path}")
-    print(f"\nNext step: python 4_train.py --preset tiny --tokenizer {args.tokenizer}")
+    print(f"\nNext step: python 4_train.py --preset tiny --tokenizer {tokenizer_type}")
+
+
+def tokenize_qa(tokenizer_type):
+    """Tokenize the merged SFT JSON into data_chat/*.bin for fine-tuning."""
+    from data.prepare_chat import prepare_chat_data
+
+    source_path = os.path.join(DATA_DIR, "qa_merged.json")
+    if not os.path.exists(source_path):
+        print(f"Error: {source_path} not found!")
+        print("Run 'python 2_prepare.py --qa' first to merge SFT sources.")
+        sys.exit(1)
+
+    print(f"\n{'='*50}")
+    print(f"  Step 3: Tokenize chat data (--qa)")
+    print(f"{'='*50}")
+    print(f"  Input:     {source_path}")
+    print(f"  Tokenizer: {tokenizer_type} (extended with chat special tokens)")
+    print(f"{'='*50}\n")
+
+    prepare_chat_data(source_path, tokenizer_type)
+
+    print(f"\nNext step: python 5_finetune.py")
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--tokenizer", type=str, required=True,
+                        choices=["char", "bpe"],
+                        help="Tokenizer type: 'char' (Level 1) or 'bpe' (Level 2)")
+    parser.add_argument("--qa", action="store_true",
+                        help="Tokenize Q&A data (data/qa_merged.json) into data_chat/ "
+                             "instead of the raw corpus")
+    args = parser.parse_args()
+
+    if args.qa:
+        tokenize_qa(args.tokenizer)
+    else:
+        tokenize_corpus(args.tokenizer)
 
 
 if __name__ == "__main__":
