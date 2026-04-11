@@ -1,13 +1,14 @@
 """
-ArmGPT Text Generation
+Step 5: Generate Armenian text from a pretrained ArmGPT checkpoint.
 
-Generate Armenian text using a trained model.
+Quick sampling tool for the Stage 1 (pretrained) model produced by
+4_train.py. For interactive chat with the fine-tuned model, use 8_chat.py.
 
 Usage:
-    python generate.py
-    python generate.py --prompt "Հայաստանի"
-    python generate.py --temperature 0.5 --length 500
-    python generate.py --checkpoint checkpoints/step_5000.pt
+    python 5_generate.py
+    python 5_generate.py --prompt "Հայաստանի"
+    python 5_generate.py --temperature 0.5 --length 500
+    python 5_generate.py --checkpoint checkpoints/step_5000.pt
 """
 
 import argparse

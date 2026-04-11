@@ -295,7 +295,7 @@ def tokenize_qa(tokenizer_type):
 
     prepare_chat_data(source_path, tokenizer_type)
 
-    print(f"\nNext step: python 5_finetune.py")
+    print(f"\nNext step: python 6_finetune.py")
 
 
 def main():

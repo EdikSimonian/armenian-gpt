@@ -410,7 +410,7 @@ def main():
     print(f"  Final perplexity: {perplexity:.2f}")
     print(f"  Checkpoint saved: {final_path}")
     print(f"  Metrics saved:    {os.path.join(cfg['checkpoint_dir'], 'metrics.json')}")
-    print(f"\n  Generate text with: python generate.py --checkpoint {final_path}")
+    print(f"\n  Generate text with: python 5_generate.py --checkpoint {final_path}")
 
 
 if __name__ == "__main__":

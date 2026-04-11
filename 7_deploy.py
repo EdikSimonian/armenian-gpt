@@ -1,5 +1,5 @@
 """
-Step 6: Deploy a trained ArmGPT model to HuggingFace Hub.
+Step 7: Deploy a trained ArmGPT model to HuggingFace Hub.
 
 Converts the PyTorch checkpoint to a HuggingFace-compatible bundle and
 uploads it along with the tokenizer and a model card.
@@ -9,9 +9,9 @@ Requirements:
     huggingface-cli login   # one-time
 
 Usage:
-    python 6_deploy.py --repo your-username/armgpt
-    python 6_deploy.py --repo your-username/armgpt --checkpoint checkpoints/step_50000.pt
-    python 6_deploy.py --repo your-username/armgpt \
+    python 7_deploy.py --repo your-username/armgpt
+    python 7_deploy.py --repo your-username/armgpt --checkpoint checkpoints/step_50000.pt
+    python 7_deploy.py --repo your-username/armgpt \
         --checkpoint checkpoints/final.pt \
         --chat_checkpoint checkpoints_chat/final.pt
 
@@ -296,7 +296,7 @@ def main():
         print("  Chat model added.")
 
     # Copy source files so users can run the model
-    for src_file in ["model.py", "generate.py",
+    for src_file in ["model.py", "5_generate.py",
                      "tokenizers/char_tokenizer.py", "tokenizers/bpe_tokenizer.py"]:
         src_path = os.path.join(os.path.dirname(__file__), src_file)
         if os.path.exists(src_path):

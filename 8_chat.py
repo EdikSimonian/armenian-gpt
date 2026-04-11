@@ -1,13 +1,13 @@
 """
-ArmGPT Chat - Interactive Armenian Chatbot
+Step 8: Interactive chat with a fine-tuned ArmGPT model.
 
-Talk to your fine-tuned ArmGPT model in the terminal.
-Type a question in Armenian, get a response. Like a mini ChatGPT!
+Talk to the chat model produced by 6_finetune.py in the terminal.
+Type a question in Armenian, get a response.
 
 Usage:
-    python chat.py
-    python chat.py --temperature 0.5
-    python chat.py --checkpoint checkpoints/chat_final.pt
+    python 8_chat.py
+    python 8_chat.py --temperature 0.5
+    python 8_chat.py --checkpoint checkpoints_chat/final.pt
 
 Type 'quit' or 'exit' to stop.
 """
@@ -29,7 +29,7 @@ def load_tokenizer(data_dir, tokenizer_type=None):
         return _load_tokenizer(data_dir, tokenizer_type)
     except (FileNotFoundError, ValueError) as e:
         print(f"Error: {e}")
-        print("Run 'python data/prepare_chat.py' then 'python 5_finetune.py' first.")
+        print("Run 'python 3_tokenize.py --qa' then 'python 6_finetune.py' first.")
         sys.exit(1)
 
 
@@ -54,8 +54,10 @@ def main():
     if not os.path.exists(args.checkpoint):
         print(f"Error: checkpoint not found at {args.checkpoint}")
         print("Fine-tune a model first:")
-        print("  1. python data/prepare_chat.py --source <sft.json>")
-        print("  2. python 5_finetune.py")
+        print("  1. python 1_download.py --qa")
+        print("  2. python 2_prepare.py --qa")
+        print("  3. python 3_tokenize.py --qa --tokenizer bpe")
+        print("  4. python 6_finetune.py")
         sys.exit(1)
 
     print("Loading model...")
