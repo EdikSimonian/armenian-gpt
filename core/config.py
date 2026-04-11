@@ -66,6 +66,45 @@ PRESETS = {
         save_interval=1000,  # snapshot every 1000 steps for tighter HF upload cadence
         sample_interval=2000,
     ),
+    # ~600 M params, Chinchilla-sized for ~11 B Armenian tokens (66 GB of text).
+    # Tuned for a single H200 141 GB: dim 1280 × 28 layers × 2048 context fits
+    # comfortably with batch 16 + grad_accum 8 (effective 128). At effective
+    # 262k tokens/step × 42k steps = ~11 B tokens seen, matching the corpus.
+    # Expected ~25 h on one H200 at ~40% MFU in BF16.
+    "xxlarge": dict(
+        n_layer=28,
+        n_head=20,
+        n_embd=1280,
+        block_size=2048,
+        batch_size=16,
+        grad_accum_steps=8,  # effective batch = 16*8 = 128
+        max_iters=42000,
+        learning_rate=2.5e-4,
+        warmup_iters=2000,
+        eval_interval=2000,
+        save_interval=1000,
+        sample_interval=2000,
+    ),
+    # xxlarge trained for 4 epochs over the same 11 B-token Armenian corpus.
+    # Per Muennighoff et al. (data-constrained scaling), 4 epochs yields
+    # ~2.3× effective unique tokens — the practical sweet spot before
+    # repeated-data returns flatten hard. Expected loss ~2.54 nats (~18%
+    # lower perplexity than single-epoch xxlarge). Expected ~100 h on one
+    # H200 at ~40% MFU in BF16 (~$350 at $3.50/hr).
+    "xxlarge_4epoch": dict(
+        n_layer=28,
+        n_head=20,
+        n_embd=1280,
+        block_size=2048,
+        batch_size=16,
+        grad_accum_steps=8,
+        max_iters=168000,    # 4 × 42000
+        learning_rate=2.5e-4,
+        warmup_iters=2000,   # 1.2% of schedule — plenty for this scale
+        eval_interval=4000,
+        save_interval=2000,  # 84 HF uploads across the run vs 168 at 1000
+        sample_interval=4000,
+    ),
     # Stage 2: fine-tuning on conversational data
     "finetune": dict(
         n_layer=6,
@@ -123,7 +162,8 @@ def get_config():
     """Parse command-line arguments and return the final config as a dict."""
     parser = argparse.ArgumentParser(description="ArmGPT Training Config")
     parser.add_argument("--preset", type=str, default=None,
-                        choices=["tiny", "small", "medium", "large", "xlarge", "finetune"],
+                        choices=["tiny", "small", "medium", "large", "xlarge",
+                                 "xxlarge", "xxlarge_4epoch", "finetune"],
                         help="Use a preset configuration")
     # Allow overriding any config value from the command line
     parser.add_argument("--n_layer", type=int, default=None)
@@ -134,6 +174,8 @@ def get_config():
     parser.add_argument("--batch_size", type=int, default=None)
     parser.add_argument("--max_iters", type=int, default=None)
     parser.add_argument("--learning_rate", type=float, default=None)
+    parser.add_argument("--min_lr", type=float, default=None,
+                        help="Floor for cosine LR decay (must be <= learning_rate)")
     parser.add_argument("--grad_accum_steps", type=int, default=None)
     parser.add_argument("--tokenizer", type=str, default=None,
                         choices=["char", "bpe"])

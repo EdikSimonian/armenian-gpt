@@ -45,9 +45,16 @@ HF_CACHE_DIR = os.path.join(DATA_DIR, "hf")
 for _d in (DATA_DIR, TEXT_DIR, TEXT_TRAIN_DIR, TEXT_FINETUNE_DIR, HF_CACHE_DIR):
     os.makedirs(_d, exist_ok=True)
 
-os.environ.setdefault("HF_HOME", HF_CACHE_DIR)
-os.environ.setdefault("HF_DATASETS_CACHE", os.path.join(HF_CACHE_DIR, "datasets"))
-os.environ.setdefault("HF_HUB_CACHE", os.path.join(HF_CACHE_DIR, "hub"))
+# Force-pin the HF cache to <project>/data/hf/ regardless of any inherited
+# HF_HOME / HF_DATASETS_CACHE / HF_HUB_CACHE from the user's shell. Using
+# direct assignment (not setdefault) so downloads never leak into
+# ~/.cache/huggingface/ even if the user has those vars exported globally.
+# These vars propagate to multiprocessing workers via env inheritance, so
+# every subprocess (Phase 2 HF streamer) lands in the same cache.
+os.environ["HF_HOME"] = HF_CACHE_DIR
+os.environ["HF_DATASETS_CACHE"] = os.path.join(HF_CACHE_DIR, "datasets")
+os.environ["HF_HUB_CACHE"] = os.path.join(HF_CACHE_DIR, "hub")
+os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(HF_CACHE_DIR, "hub")
 
 import sys
 import gc
@@ -59,6 +66,7 @@ import random
 import shutil
 import argparse
 import urllib.request
+import xml.etree.ElementTree as ET
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 RAW_FILE = os.path.join(TEXT_TRAIN_DIR, "raw_text.txt")
@@ -97,6 +105,52 @@ def get_file_size_mb(path):
     if os.path.exists(path):
         return os.path.getsize(path) / (1024 * 1024)
     return 0
+
+
+def _marker_path(name):
+    return os.path.join(TEXT_TRAIN_DIR, f".{name}_done")
+
+
+def _marker_exists(name):
+    return os.path.exists(_marker_path(name))
+
+
+def _write_marker(name):
+    with open(_marker_path(name), "w") as f:
+        f.write("done")
+
+
+def _append_to_raw(src_path):
+    """Append contents of src_path (+ blank-line separator) to raw_text.txt.
+
+    Opens raw_text.txt in append-binary mode (never truncates) and streams
+    src into it using 16 MB buffered reads. fsyncs on close so a crash
+    immediately after won't lose the committed bytes.
+    """
+    with open(RAW_FILE, "ab", buffering=IO_BUFFER) as fout:
+        with open(src_path, "rb", buffering=IO_BUFFER) as fin:
+            while True:
+                chunk = fin.read(IO_BUFFER)
+                if not chunk:
+                    break
+                fout.write(chunk)
+        fout.write(b"\n\n")
+        fout.flush()
+        os.fsync(fout.fileno())
+
+
+def _commit_source(name, src_path):
+    """Append src → raw_text.txt, delete src, write marker.
+
+    The marker is written AFTER the append completes, so a crash during
+    append leaves no marker and the source is re-downloaded on restart.
+    """
+    size_mb = os.path.getsize(src_path) / (1024 * 1024)
+    print(f"  [{name}] Appending {size_mb:.0f} MB to raw_text.txt...")
+    _append_to_raw(src_path)
+    os.remove(src_path)
+    _write_marker(name)
+    print(f"  [{name}] Committed ({size_mb:.0f} MB), intermediate deleted.")
 
 
 # =============================================================================
@@ -149,49 +203,104 @@ def _strip_wiki_markup(text):
 
 
 def _extract_wiki_articles(dump_path):
-    """Yield cleaned article bodies from the bz2 Wikipedia XML dump."""
-    current_text = []
-    in_text = False
-    article_count = 0
+    """Yield cleaned article bodies from the bz2 Wikipedia XML dump.
 
-    with bz2.open(dump_path, "rt", encoding="utf-8") as f:
-        for line in f:
-            if "<text" in line:
-                in_text = True
-                match = re.search(r"<text[^>]*>(.*)", line)
-                if match:
-                    current_text.append(match.group(1))
+    Uses xml.etree.iterparse to stream the dump page-by-page. Only pages in
+    the main namespace (<ns>0</ns>) are emitted — skipping MediaWiki:,
+    Template:, Help:, Category:, User:, File:, etc. Redirects and very
+    short pages are filtered too.
+
+    The previous line-by-line regex version was broken two ways: (1) it
+    didn't look at <ns> at all, so ~90% of what it extracted was UI
+    translation strings, templates, and help pages, and (2) single-line
+    <text>...</text> articles were dropped because the end tag on the same
+    line as the open tag was never inspected.
+    """
+    article_count = 0
+    skipped = {"ns": 0, "redirect": 0, "too_short": 0, "empty": 0}
+
+    # Wikipedia dumps declare xmlns="http://www.mediawiki.org/xml/export-0.11/"
+    # on the root, so iterparse produces namespaced tags like
+    # "{http://www.mediawiki.org/xml/export-0.11/}page". Strip the prefix
+    # dynamically off the first element we see so we don't hardcode a version.
+    ns_prefix = None
+
+    with bz2.open(dump_path, "rb") as f:
+        context = ET.iterparse(f, events=("start", "end"))
+        root = None
+
+        for event, elem in context:
+            if ns_prefix is None and "}" in elem.tag:
+                ns_prefix = elem.tag.split("}", 1)[0] + "}"
+
+            if event == "start" and root is None:
+                root = elem
                 continue
 
-            if in_text:
-                if "</text>" in line:
-                    current_text.append(line.split("</text>")[0])
-                    full_text = "\n".join(current_text)
-                    current_text = []
-                    in_text = False
+            if event != "end":
+                continue
 
-                    if full_text.startswith("#REDIRECT") or \
-                       full_text.startswith("#ՎԵՐԱՀՂՈՒՄ") or \
-                       len(full_text) < 200:
-                        continue
+            tag = elem.tag[len(ns_prefix):] if ns_prefix else elem.tag
+            if tag != "page":
+                continue
 
-                    cleaned = _strip_wiki_markup(full_text)
-                    if len(cleaned) > 100:
-                        article_count += 1
-                        if article_count % 10000 == 0:
-                            print(f"    Extracted {article_count} articles...")
-                        yield cleaned
+            # Completed a <page> — inspect its ns and revision text.
+            ns_elem = elem.find(f"{ns_prefix}ns")
+            text_elem = elem.find(f"{ns_prefix}revision/{ns_prefix}text")
+
+            page_ns = None
+            if ns_elem is not None and ns_elem.text is not None:
+                try:
+                    page_ns = int(ns_elem.text)
+                except ValueError:
+                    pass
+            text = text_elem.text if text_elem is not None else None
+
+            # Free memory: detach this page from the root so the DOM doesn't
+            # accumulate 325k empty <page> shells.
+            elem.clear()
+            if root is not None:
+                root.remove(elem)
+
+            if page_ns != 0:
+                skipped["ns"] += 1
+                continue
+            if not text:
+                skipped["empty"] += 1
+                continue
+            if text.startswith("#REDIRECT") or text.startswith("#ՎԵՐԱՀՂՈՒՄ"):
+                skipped["redirect"] += 1
+                continue
+            if len(text) < 200:
+                skipped["too_short"] += 1
+                continue
+
+            cleaned = _strip_wiki_markup(text)
+            if len(cleaned) > 100:
+                article_count += 1
+                if article_count % 10000 == 0:
+                    print(f"    Extracted {article_count} articles...")
+                yield cleaned
+            else:
+                skipped["too_short"] += 1
 
     print(f"  Total articles extracted: {article_count}")
+    print(f"  Skipped: ns={skipped['ns']:,}  "
+          f"redirect={skipped['redirect']:,}  "
+          f"too_short={skipped['too_short']:,}  "
+          f"empty={skipped['empty']:,}")
 
 
 def download_wikipedia():
-    """Download Armenian Wikipedia and extract articles."""
-    marker = os.path.join(TEXT_TRAIN_DIR, ".wiki_done")
+    """Download Armenian Wikipedia dump and extract articles to wiki_hy.txt.
+
+    Returns the path to the extracted intermediate file. Does NOT write a
+    marker — the orchestrator writes the marker only after _commit_source
+    appends the file into raw_text.txt.
+    """
     out_file = os.path.join(TEXT_TRAIN_DIR, "wiki_hy.txt")
-    if os.path.exists(marker):
-        print("  Wikipedia: already done, skipping.")
-        return out_file
+    if os.path.exists(out_file):
+        os.remove(out_file)
 
     _download_wiki_dump()
 
@@ -204,8 +313,6 @@ def download_wikipedia():
             chars += len(article_text)
 
     print(f"  Wikipedia: {chars:,} chars ({chars / 1024 / 1024:.0f} MB)")
-    with open(marker, "w") as f:
-        f.write("done")
     return out_file
 
 
@@ -214,19 +321,23 @@ def download_wikipedia():
 # -----------------------------------------------------------------------------
 
 def download_cc100():
-    """Download and decompress CC-100 Armenian data."""
-    marker = os.path.join(TEXT_TRAIN_DIR, ".cc100_done")
-    out_file = os.path.join(TEXT_TRAIN_DIR, "cc100_hy.txt")
-    if os.path.exists(marker):
-        print("  CC-100: already done, skipping.")
-        return out_file
+    """Download and decompress CC-100 Armenian data to cc100_hy.txt.
 
+    Returns the path to the decompressed intermediate file. Does NOT write
+    a marker — the orchestrator writes the marker only after _commit_source
+    appends the file into raw_text.txt.
+    """
     import lzma
 
-    cc100_url = "https://data.statmt.org/cc-100/hy.txt.xz"
+    out_file = os.path.join(TEXT_TRAIN_DIR, "cc100_hy.txt")
     cc100_xz = os.path.join(TEXT_TRAIN_DIR, "cc100_hy.txt.xz")
 
-    if not os.path.exists(cc100_xz) and not os.path.exists(out_file):
+    if os.path.exists(out_file):
+        os.remove(out_file)
+
+    cc100_url = "https://data.statmt.org/cc-100/hy.txt.xz"
+
+    if not os.path.exists(cc100_xz):
         print("  Downloading CC-100 (~776 MB)...")
 
         def progress(block_num, block_size, total_size):
@@ -240,27 +351,282 @@ def download_cc100():
         urllib.request.urlretrieve(cc100_url, cc100_xz, reporthook=progress)
         print("\n  Download complete!")
 
-    if not os.path.exists(out_file):
-        print("  Decompressing CC-100 (this takes a few minutes)...")
-        chars = 0
-        with lzma.open(cc100_xz, "rt", encoding="utf-8") as f_in, \
-             open(out_file, "w", encoding="utf-8", buffering=IO_BUFFER) as f_out:
-            while True:
-                chunk = f_in.read(IO_BUFFER)
-                if not chunk:
-                    break
-                f_out.write(chunk)
-                chars += len(chunk)
-                if chars % 500_000_000 == 0:
-                    print(f"  {chars / 1_000_000_000:.1f}G chars...")
+    print("  Decompressing CC-100 (this takes a few minutes)...")
+    chars = 0
+    with lzma.open(cc100_xz, "rt", encoding="utf-8") as f_in, \
+         open(out_file, "w", encoding="utf-8", buffering=IO_BUFFER) as f_out:
+        while True:
+            chunk = f_in.read(IO_BUFFER)
+            if not chunk:
+                break
+            f_out.write(chunk)
+            chars += len(chunk)
+            if chars % 500_000_000 == 0:
+                print(f"  {chars / 1_000_000_000:.1f}G chars...")
 
-        print(f"  CC-100: {chars:,} chars decompressed")
+    print(f"  CC-100: {chars:,} chars decompressed")
 
-        if os.path.exists(cc100_xz):
-            os.remove(cc100_xz)
+    if os.path.exists(cc100_xz):
+        os.remove(cc100_xz)
 
-    with open(marker, "w") as f:
-        f.write("done")
+    return out_file
+
+
+# -----------------------------------------------------------------------------
+# HPLT 3.0 (direct HTTP + zstandard shards — not on HF as a loadable dataset)
+# -----------------------------------------------------------------------------
+
+HPLT3_MAP_URL = "https://data.hplt-project.org/three/sorted/hye_Armn.map"
+
+
+def download_hplt3():
+    """Download HPLT 3.0 Armenian shards directly from data.hplt-project.org.
+
+    HPLT 3.0 is distributed as a ``.map`` manifest listing one or more
+    zstd-compressed JSONL shard URLs. Each JSONL line is one document with
+    a ``text`` field (plus metadata we ignore). Shards are organised by
+    quality-score buckets (5 = lowest, 10 = highest quality).
+
+    We stream each shard through the zstandard decompressor line-by-line
+    and write the ``text`` field into hplt3_hy.txt. Shard files are NOT
+    written to disk — memory-only streaming, bounded by the decompressor
+    buffer and one line at a time.
+    """
+    import json
+    import zstandard
+
+    out_file = os.path.join(TEXT_TRAIN_DIR, "hplt3_hy.txt")
+    if os.path.exists(out_file):
+        os.remove(out_file)
+
+    print("  Fetching HPLT 3.0 Armenian shard manifest...")
+    with urllib.request.urlopen(HPLT3_MAP_URL, timeout=30) as resp:
+        manifest = resp.read().decode("utf-8").strip().splitlines()
+    shard_urls = [line.strip() for line in manifest if line.strip()]
+    print(f"  Manifest: {len(shard_urls)} shards")
+
+    chars = 0
+    docs = 0
+    t0 = time.time()
+    dctx = zstandard.ZstdDecompressor()
+
+    with open(out_file, "w", encoding="utf-8", buffering=IO_BUFFER) as fout:
+        for i, shard_url in enumerate(shard_urls, 1):
+            shard_name = shard_url.rsplit("/", 1)[-1]
+            print(f"  [{i}/{len(shard_urls)}] {shard_name} ...", flush=True)
+
+            req = urllib.request.Request(shard_url)
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                # Stream-decompress the HTTPS body through zstandard.
+                # stream_reader wraps the raw response, yielding decompressed
+                # bytes; we wrap again with TextIOWrapper for line iteration.
+                with dctx.stream_reader(resp) as reader:
+                    import io as _io
+                    text_stream = _io.TextIOWrapper(reader, encoding="utf-8")
+                    for line in text_stream:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            row = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        text = row.get("text", "") or ""
+                        text = text.strip()
+                        if len(text) < 50:
+                            continue
+                        fout.write(text)
+                        fout.write("\n\n")
+                        chars += len(text)
+                        docs += 1
+                        if docs % 50_000 == 0:
+                            elapsed = time.time() - t0
+                            rate = chars / elapsed / 1_000_000 if elapsed > 0 else 0
+                            print(
+                                f"    {docs:,} docs, {chars / 1_000_000:.0f}M chars "
+                                f"({rate:.1f} MB/s)",
+                                flush=True,
+                            )
+
+    elapsed = time.time() - t0
+    print(f"  HPLT 3.0: {docs:,} docs, {chars:,} chars "
+          f"({chars / 1024 / 1024:.0f} MB) in {fmt_time(elapsed)}")
+    return out_file
+
+
+# -----------------------------------------------------------------------------
+# ARLIS Armenian legislation database (direct HTTP, JSONL.xz with HTML body)
+# -----------------------------------------------------------------------------
+
+ARLIS_URL = "https://opendataam.sfo3.cdn.digitaloceanspaces.com/arlis/arlis_docs.jsonl.xz"
+
+
+def _strip_arlis_html(html):
+    """Clean ARLIS legal-document body HTML to plain Armenian text.
+
+    ARLIS bodies arrive as HTML with numeric character references like
+    ``&#1329;`` for Armenian letters. We unescape entities, drop tags,
+    collapse whitespace. Keeps structure at paragraph level.
+    """
+    import html as _html
+    text = _html.unescape(html)
+    text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"</p\s*>", "\n\n", text, flags=re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def download_arlis():
+    """Download the ARLIS Armenian legal corpus and extract clean text.
+
+    Produces arlis_hy.txt containing one document per entry, each entry
+    being ``title\\n\\nbody_cleaned``.
+    """
+    import lzma
+    import json
+
+    out_file = os.path.join(TEXT_TRAIN_DIR, "arlis_hy.txt")
+    arlis_xz = os.path.join(TEXT_TRAIN_DIR, "arlis_docs.jsonl.xz")
+
+    if os.path.exists(out_file):
+        os.remove(out_file)
+
+    if not os.path.exists(arlis_xz):
+        print("  Downloading ARLIS legal corpus (~508 MB)...")
+
+        def progress(block_num, block_size, total_size):
+            downloaded = block_num * block_size
+            if total_size > 0:
+                pct = min(100, downloaded * 100 / total_size)
+                mb = downloaded / (1024 * 1024)
+                sys.stdout.write(f"\r  {pct:.1f}% ({mb:.0f} MB)")
+                sys.stdout.flush()
+
+        urllib.request.urlretrieve(ARLIS_URL, arlis_xz, reporthook=progress)
+        print("\n  Download complete!")
+
+    print("  Extracting ARLIS documents (HTML → plain text)...")
+    docs = 0
+    chars = 0
+    t0 = time.time()
+
+    with lzma.open(arlis_xz, "rt", encoding="utf-8") as f_in, \
+         open(out_file, "w", encoding="utf-8", buffering=IO_BUFFER) as f_out:
+        for line in f_in:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            title = (row.get("title") or "").strip()
+            body_html = row.get("body") or ""
+            body = _strip_arlis_html(body_html)
+            if len(body) < 100:
+                continue
+            if title:
+                f_out.write(title)
+                f_out.write("\n\n")
+                chars += len(title) + 2
+            f_out.write(body)
+            f_out.write("\n\n")
+            chars += len(body) + 2
+            docs += 1
+            if docs % 5000 == 0:
+                elapsed = time.time() - t0
+                rate = chars / elapsed / 1_000_000 if elapsed > 0 else 0
+                print(f"    {docs:,} docs, {chars / 1_000_000:.0f}M chars "
+                      f"({rate:.1f} MB/s)", flush=True)
+
+    print(f"  ARLIS: {docs:,} docs, {chars:,} chars "
+          f"({chars / 1024 / 1024:.0f} MB)")
+
+    if os.path.exists(arlis_xz):
+        os.remove(arlis_xz)
+
+    return out_file
+
+
+# -----------------------------------------------------------------------------
+# OpenSubtitles 2024 (HF, parallel corpus with src/tgt lang columns)
+# -----------------------------------------------------------------------------
+
+def download_opensubtitles():
+    """Extract Armenian sides of Helsinki-NLP/OpenSubtitles2024.
+
+    The dataset is a parallel bitext: each row has ``src_text``, ``tgt_text``,
+    ``src_lang``, ``tgt_lang``. Armenian appears in the ``validation`` and
+    ``test`` splits only (no ``train`` split). We iterate both and pull
+    ``src_text`` where ``src_lang == "hy"`` and ``tgt_text`` where
+    ``tgt_lang == "hy"``, de-duplicating identical lines so we don't count
+    the same Armenian utterance twice when it appears with multiple
+    target languages.
+
+    Requires HF gate acceptance:
+    https://huggingface.co/datasets/Helsinki-NLP/OpenSubtitles2024
+    """
+    from datasets import load_dataset
+    from huggingface_hub import get_token
+
+    out_file = os.path.join(TEXT_TRAIN_DIR, "opensubtitles_hy.txt")
+    if os.path.exists(out_file):
+        os.remove(out_file)
+
+    hf_token = os.environ.get("HF_TOKEN") or get_token()
+    seen = set()  # dedupe identical Armenian sentences across bitext pairs
+    chars = 0
+    docs = 0
+    t0 = time.time()
+
+    with open(out_file, "w", encoding="utf-8", buffering=IO_BUFFER) as fout:
+        for split in ("validation", "test"):
+            print(f"  Streaming OpenSubtitles2024 [{split}] split...", flush=True)
+            try:
+                ds = load_dataset(
+                    "Helsinki-NLP/OpenSubtitles2024", "default",
+                    split=split, streaming=True, token=hf_token,
+                )
+            except Exception as e:
+                print(f"  [opensubtitles:{split}] load failed: {e}")
+                continue
+
+            for row in ds:
+                texts = []
+                if row.get("src_lang") == "hy":
+                    t = (row.get("src_text") or "").strip()
+                    if t:
+                        texts.append(t)
+                if row.get("tgt_lang") == "hy":
+                    t = (row.get("tgt_text") or "").strip()
+                    if t:
+                        texts.append(t)
+                del row
+                for t in texts:
+                    if len(t) < 5:
+                        continue
+                    if t in seen:
+                        continue
+                    seen.add(t)
+                    fout.write(t)
+                    fout.write("\n")
+                    chars += len(t) + 1
+                    docs += 1
+                    if docs % 50_000 == 0:
+                        elapsed = time.time() - t0
+                        rate = chars / elapsed / 1_000_000 if elapsed > 0 else 0
+                        print(
+                            f"    {docs:,} unique hy lines, {chars / 1_000_000:.1f}M chars "
+                            f"({rate:.2f} MB/s)",
+                            flush=True,
+                        )
+            gc.collect()
+
+    elapsed = time.time() - t0
+    print(f"  OpenSubtitles: {docs:,} unique lines, {chars:,} chars "
+          f"({chars / 1024 / 1024:.1f} MB) in {fmt_time(elapsed)}")
     return out_file
 
 
@@ -271,33 +637,55 @@ def download_cc100():
 def _download_hf_worker(args):
     """
     Worker function for parallel HF downloads.
-    Runs in a separate process. Downloads one dataset via streaming
-    and writes to its own text file. Inherits HF_HOME/HF_DATASETS_CACHE
-    from the parent so the cache lives under data/hf/.
+    Runs in a separate process. Streams one dataset and writes to its
+    own intermediate text file. The parent process (orchestrator) is
+    responsible for appending the file into raw_text.txt and writing
+    the marker after the worker returns.
+
+    args format (tuple):
+        (name, dataset_id, lang_config, text_field, out_file, hf_token,
+         filter_field, filter_value)
+
+    ``filter_field`` / ``filter_value`` are optional (may be ``None``).
+    When set, rows where ``example[filter_field] != filter_value`` are
+    dropped — used to pull Armenian-only rows from CC-News, which doesn't
+    expose language as a config.
     """
-    name, dataset_id, lang_config, text_field, out_file, marker_file = args
+    (name, dataset_id, lang_config, text_field, out_file, hf_token,
+     filter_field, filter_value) = args
 
-    if os.path.exists(marker_file):
-        return name, out_file, 0, 0, True
+    if os.path.exists(out_file):
+        os.remove(out_file)
 
-    # Reimport in subprocess (datasets picks up HF_HOME from env)
+    import gc as _gc
     from datasets import load_dataset
 
-    print(f"  [{name}] Starting download ({dataset_id})...")
+    print(f"  [{name}] Starting download ({dataset_id})...", flush=True)
     t0 = time.time()
 
-    ds = load_dataset(dataset_id, lang_config,
-                      split="train", streaming=True)
+    ds = load_dataset(
+        dataset_id, lang_config,
+        split="train", streaming=True, token=hf_token,
+    )
 
     chars = 0
     docs = 0
+    skipped = 0
     write_buf = []
     buf_size = 0
     FLUSH_THRESHOLD = 5 * 1024 * 1024  # 5 MB
 
     with open(out_file, "w", encoding="utf-8", buffering=IO_BUFFER) as f:
         for example in ds:
-            text = example[text_field].strip()
+            if filter_field is not None and example.get(filter_field) != filter_value:
+                skipped += 1
+                del example
+                continue
+            text = example.get(text_field, "")
+            del example  # drop reference to Arrow row; helps streaming GC
+            if text is None:
+                continue
+            text = text.strip()
             if len(text) < 50:
                 continue
             write_buf.append(text)
@@ -312,108 +700,191 @@ def _download_hf_worker(args):
                 buf_size = 0
 
             if docs % 100_000 == 0:
+                _gc.collect()  # reclaim streaming iterator caches
                 elapsed = time.time() - t0
                 rate = chars / elapsed / 1_000_000 if elapsed > 0 else 0
-                print(f"  [{name}] {docs:,} docs, {chars / 1_000_000:.0f}M chars "
-                      f"({rate:.1f} MB/s)")
+                print(
+                    f"  [{name}] {docs:,} docs, {chars / 1_000_000:.0f}M chars "
+                    f"({rate:.1f} MB/s)",
+                    flush=True,
+                )
 
         if write_buf:
             f.write("".join(write_buf))
+            write_buf.clear()
 
     elapsed = time.time() - t0
-    print(f"  [{name}] Done: {docs:,} docs, {chars / 1024 / 1024:.0f} MB "
-          f"in {fmt_time(elapsed)}")
+    print(
+        f"  [{name}] Done: {docs:,} docs, {chars / 1024 / 1024:.0f} MB "
+        f"in {fmt_time(elapsed)}",
+        flush=True,
+    )
 
-    with open(marker_file, "w") as f:
-        f.write("done")
-
-    return name, out_file, docs, chars, False
-
-
-# -----------------------------------------------------------------------------
-# Merge files into raw_text.txt
-# -----------------------------------------------------------------------------
-
-def merge_files(file_list, output_path):
-    """Merge multiple text files into one, using large I/O buffers."""
-    print(f"\nMerging {len(file_list)} files into {os.path.basename(output_path)}...")
-    t0 = time.time()
-    total_bytes = 0
-
-    with open(output_path, "wb", buffering=IO_BUFFER) as fout:
-        for i, src_path in enumerate(file_list):
-            if not os.path.exists(src_path):
-                print(f"  Warning: {src_path} not found, skipping")
-                continue
-
-            src_size = os.path.getsize(src_path) / (1024 * 1024)
-            print(f"  [{i+1}/{len(file_list)}] {os.path.basename(src_path)} "
-                  f"({src_size:.0f} MB)...")
-
-            with open(src_path, "rb", buffering=IO_BUFFER) as fin:
-                while True:
-                    chunk = fin.read(IO_BUFFER)
-                    if not chunk:
-                        break
-                    fout.write(chunk)
-                    total_bytes += len(chunk)
-
-            sep = b"\n\n"
-            fout.write(sep)
-            total_bytes += len(sep)
-
-    elapsed = time.time() - t0
-    total_mb = total_bytes / (1024 * 1024)
-    rate = total_mb / elapsed if elapsed > 0 else 0
-    print(f"  Merged {total_mb:.0f} MB in {fmt_time(elapsed)} ({rate:.0f} MB/s)")
+    return name, out_file, docs, chars
 
 
 def download_corpus(args):
-    """Download all pretraining text sources and merge into raw_text.txt."""
+    """Download pretraining sources and stream-append each into raw_text.txt.
+
+    Per-source lifecycle:
+        1. If marker `.{name}_done` exists → skip entirely.
+        2. Otherwise: download source → append to raw_text.txt → delete
+           intermediate → write marker.
+
+    Peak disk footprint = raw_text.txt + (intermediates of sources currently
+    in-flight). The wiki `.bz2` and cc100 `.xz` are deleted as soon as
+    their extracted text is committed.
+
+    Source inventory:
+        Phase 1 direct downloads:
+            wiki     — Armenian Wikipedia (dump → extract)
+            cc100    — CC-100 Armenian (xz → decompress)
+            hplt3    — HPLT 3.0 Armenian (zstd shards via .map manifest)
+            arlis    — ARLIS legal corpus (jsonl.xz, HTML body → text)
+        Phase 2 HuggingFace streaming (parallel):
+            culturax — uonlp/CulturaX (hy)
+            mc4      — allenai/c4 (hy)
+            glot500  — cis-lmu/Glot500 (hye_Armn)
+            ccnews_2023, ccnews_2024 — stanford-oval/ccnews with lang filter
+            opensubtitles — Helsinki-NLP/OpenSubtitles2024 (gated, optional)
+
+    HPLT 2.0 has been replaced by HPLT 3.0 — same pipeline, expanded time
+    window (2012-2024), better extractor. OSCAR-2301 not included —
+    gated-with-manual-review and access was not granted.
+    """
     skip = set(s.lower() for s in args.skip)
 
+    # Each HF source entry: dict with repo, config, text_field,
+    # optional filter_field / filter_value for row-level filtering.
     hf_sources = {
-        "culturax": ("uonlp/CulturaX", "hy", "text"),
-        "oscar": ("oscar-corpus/OSCAR-2301", "hy", "text"),
-        "mc4": ("allenai/c4", "hy", "text"),
-        "hplt": ("HPLT/HPLT2.0_cleaned", "hye_Armn", "text"),
-        "glot500": ("cis-lmu/Glot500", "hye_Armn", "text"),
+        "culturax": {
+            "repo": "uonlp/CulturaX", "config": "hy", "text_field": "text",
+        },
+        "mc4": {
+            "repo": "allenai/c4", "config": "hy", "text_field": "text",
+        },
+        "glot500": {
+            "repo": "cis-lmu/Glot500", "config": "hye_Armn", "text_field": "text",
+        },
+        "ccnews_2023": {
+            "repo": "stanford-oval/ccnews", "config": "2023",
+            "text_field": "plain_text",
+            "filter_field": "language", "filter_value": "hy",
+        },
+        "ccnews_2024": {
+            "repo": "stanford-oval/ccnews", "config": "2024",
+            "text_field": "plain_text",
+            "filter_field": "language", "filter_value": "hy",
+        },
     }
 
+    # Resolve HF token once in the parent; pass explicitly to workers so
+    # multiprocessing spawn workers auth reliably (don't rely on env var
+    # or ~/.cache lookups inside fresh subprocess interpreters).
+    hf_token = os.environ.get("HF_TOKEN")
+    if not hf_token:
+        try:
+            from huggingface_hub import get_token
+            hf_token = get_token()
+        except Exception:
+            hf_token = None
+
     print(f"{'='*60}")
-    print(f"  ArmGPT Corpus Download — Parallel Mode")
+    print(f"  ArmGPT Corpus Download — Stream & Append Mode")
     print(f"{'='*60}")
     print(f"  Output:     {RAW_FILE}")
     print(f"  HF cache:   {HF_CACHE_DIR}")
     print(f"  HF workers: {args.workers}")
+    print(f"  HF auth:    {'token present' if hf_token else 'NONE (unauthenticated)'}")
     if skip:
         print(f"  Skipping:   {', '.join(skip)}")
     print(f"{'='*60}\n")
 
-    t_start = time.time()
-    source_files = []  # ordered list of files to merge
+    # Ensure raw_text.txt exists so the first "ab" open doesn't error.
+    if not os.path.exists(RAW_FILE):
+        open(RAW_FILE, "wb").close()
 
-    # ---- Phase 1: Wikipedia + CC-100 (sequential, direct downloads) ----
+    t_start = time.time()
+
+    # ---- Phase 1: Wikipedia + CC-100 (sequential direct downloads) ----
     print("=" * 40)
     print("Phase 1: Direct downloads")
     print("=" * 40)
 
-    if "wiki" not in skip:
+    if "wiki" in skip:
+        print("[SKIP] Wikipedia")
+    elif _marker_exists("wiki"):
+        print("\n[WIKI] Already committed to raw_text.txt, skipping.")
+    else:
         print("\n[WIKI] Armenian Wikipedia (~1.5 GB)")
         wiki_file = download_wikipedia()
-        source_files.append(wiki_file)
-    else:
-        print("[SKIP] Wikipedia")
+        _commit_source("wiki", wiki_file)
+        # Drop the wiki dump .bz2 right after commit — we never need it again
+        # for this run, and cleanup preserves markers so a rerun also skips.
+        if os.path.exists(DUMP_FILE):
+            dump_mb = os.path.getsize(DUMP_FILE) / (1024 * 1024)
+            os.remove(DUMP_FILE)
+            print(f"  Removed wiki dump ({dump_mb:.0f} MB)")
 
-    if "cc100" not in skip:
+    if "cc100" in skip:
+        print("[SKIP] CC-100")
+    elif _marker_exists("cc100"):
+        print("\n[CC100] Already committed to raw_text.txt, skipping.")
+    else:
         print("\n[CC100] CC-100 Armenian (~4.9 GB)")
         cc100_file = download_cc100()
-        source_files.append(cc100_file)
-    else:
-        print("[SKIP] CC-100")
+        _commit_source("cc100", cc100_file)
 
-    # ---- Phase 2: HuggingFace sources (parallel downloads) ----
-    hf_to_download = {k: v for k, v in hf_sources.items() if k not in skip}
+    if "hplt3" in skip:
+        print("[SKIP] HPLT 3.0")
+    elif _marker_exists("hplt3"):
+        print("\n[HPLT3] Already committed to raw_text.txt, skipping.")
+    else:
+        print("\n[HPLT3] HPLT 3.0 Armenian (~8.3 GB compressed, ~25 GB text)")
+        hplt3_file = download_hplt3()
+        _commit_source("hplt3", hplt3_file)
+
+    if "arlis" in skip:
+        print("[SKIP] ARLIS")
+    elif _marker_exists("arlis"):
+        print("\n[ARLIS] Already committed to raw_text.txt, skipping.")
+    else:
+        print("\n[ARLIS] Armenian legislation database (~508 MB compressed)")
+        arlis_file = download_arlis()
+        _commit_source("arlis", arlis_file)
+
+    if "opensubtitles" in skip:
+        print("[SKIP] OpenSubtitles")
+    elif _marker_exists("opensubtitles"):
+        print("\n[OPENSUBTITLES] Already committed to raw_text.txt, skipping.")
+    else:
+        print("\n[OPENSUBTITLES] Helsinki-NLP/OpenSubtitles2024 (validation + test, hy filter)")
+        try:
+            os_file = download_opensubtitles()
+            if os.path.exists(os_file) and os.path.getsize(os_file) > 0:
+                _commit_source("opensubtitles", os_file)
+            else:
+                print("  OpenSubtitles: empty output, nothing to commit.")
+                if os.path.exists(os_file):
+                    os.remove(os_file)
+        except Exception as e:
+            print(f"  OpenSubtitles: ERROR {e}")
+            partial = os.path.join(TEXT_TRAIN_DIR, "opensubtitles_hy.txt")
+            if os.path.exists(partial):
+                try:
+                    os.remove(partial)
+                except OSError:
+                    pass
+
+    # ---- Phase 2: HuggingFace sources (parallel download, sequential commit) ----
+    hf_to_download = {}
+    for name, cfg in hf_sources.items():
+        if name in skip:
+            print(f"[SKIP] {name}")
+        elif _marker_exists(name):
+            print(f"[{name.upper()}] Already committed to raw_text.txt, skipping.")
+        else:
+            hf_to_download[name] = cfg
 
     if hf_to_download:
         print(f"\n{'='*40}")
@@ -421,12 +892,18 @@ def download_corpus(args):
         print(f"{'='*40}")
 
         worker_args = []
-        hf_file_map = {}
-        for name, (dataset_id, lang, text_field) in hf_to_download.items():
+        for name, cfg in hf_to_download.items():
             out_file = os.path.join(TEXT_TRAIN_DIR, f"{name}_hy.txt")
-            marker = os.path.join(TEXT_TRAIN_DIR, f".{name}_done")
-            worker_args.append((name, dataset_id, lang, text_field, out_file, marker))
-            hf_file_map[name] = out_file
+            worker_args.append((
+                name,
+                cfg["repo"],
+                cfg["config"],
+                cfg["text_field"],
+                out_file,
+                hf_token,
+                cfg.get("filter_field"),
+                cfg.get("filter_value"),
+            ))
 
         n_workers = min(args.workers, len(worker_args))
         print(f"  Launching {n_workers} parallel workers...\n")
@@ -439,61 +916,42 @@ def download_corpus(args):
             for future in as_completed(futures):
                 name = futures[future]
                 try:
-                    name, out_file, docs, chars, was_cached = future.result()
-                    if was_cached:
-                        print(f"  [{name}] Already downloaded, skipping.")
+                    _name, out_file, docs, chars = future.result()
+                    if os.path.exists(out_file) and os.path.getsize(out_file) > 0:
+                        print(
+                            f"  [{name}] Streamed: {docs:,} docs, "
+                            f"{chars / 1024 / 1024:.0f} MB"
+                        )
+                        _commit_source(name, out_file)
                     else:
-                        print(f"  [{name}] Complete: {docs:,} docs, "
-                              f"{chars / 1024 / 1024:.0f} MB")
+                        print(f"  [{name}] Empty output, nothing to commit.")
                 except Exception as e:
                     print(f"  [{name}] ERROR: {e}")
-                    print(f"  [{name}] Will be skipped in merge.")
+                    # Clean up any partial intermediate left by the crashed worker
+                    partial = os.path.join(TEXT_TRAIN_DIR, f"{name}_hy.txt")
+                    if os.path.exists(partial):
+                        try:
+                            os.remove(partial)
+                        except OSError:
+                            pass
+                    print(f"  [{name}] Skipped — will be retried on next run.")
 
-        for name in ["culturax", "oscar", "mc4", "hplt", "glot500"]:
-            if name in hf_file_map:
-                f = hf_file_map[name]
-                marker = os.path.join(TEXT_TRAIN_DIR, f".{name}_done")
-                if os.path.exists(f) and os.path.exists(marker):
-                    source_files.append(f)
-                elif os.path.exists(f):
-                    print(f"  [{name}] Incomplete download (no marker), skipping.")
-
-    for name in hf_sources:
-        if name in skip:
-            print(f"[SKIP] {name}")
-
-    # ---- Phase 3: Merge all source files into raw_text.txt ----
+    # ---- Phase 3: Final cleanup ----
     print(f"\n{'='*40}")
-    print(f"Phase 3: Merge")
-    print(f"{'='*40}")
-
-    if source_files:
-        merge_files(source_files, RAW_FILE)
-    else:
-        print("  No source files to merge!")
-
-    # ---- Phase 4: Cleanup ----
-    print(f"\n{'='*40}")
-    print(f"Phase 4: Cleanup")
+    print(f"Phase 3: Cleanup")
     print(f"{'='*40}")
 
     clear_hf_cache()
 
-    freed = 0
-    for f in source_files:
-        if os.path.exists(f):
-            size = os.path.getsize(f)
-            os.remove(f)
-            freed += size
-            print(f"  Removed {os.path.basename(f)} ({size / 1024 / 1024:.0f} MB)")
-    if freed > 0:
-        print(f"  Freed {freed / 1024 / 1024 / 1024:.1f} GB")
-
-    # Remove leftover compressed files in TEXT_TRAIN_DIR
+    # Only sweep stray .bz2 / .xz intermediates. Markers and raw_text.txt
+    # are preserved — markers are what lets a subsequent run skip work.
     for f in os.listdir(TEXT_TRAIN_DIR):
-        if f.endswith((".xz", ".bz2")) and os.path.isfile(os.path.join(TEXT_TRAIN_DIR, f)):
-            path = os.path.join(TEXT_TRAIN_DIR, f)
-            print(f"  Removing {f} ({os.path.getsize(path) / 1024 / 1024:.0f} MB)")
+        path = os.path.join(TEXT_TRAIN_DIR, f)
+        if not os.path.isfile(path):
+            continue
+        if f.endswith((".bz2", ".xz")):
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            print(f"  Removing stray {f} ({size_mb:.0f} MB)")
             os.remove(path)
 
     elapsed = time.time() - t_start
@@ -1055,7 +1513,8 @@ def main():
     parser.add_argument("--qa", action="store_true",
                         help="Download SFT Q&A sources (ArmBench + Aya) instead of raw corpus")
     parser.add_argument("--skip", nargs="*", default=[],
-                        help="Sources to skip. Corpus: wiki cc100 culturax oscar mc4 hplt glot500. "
+                        help="Sources to skip. Corpus: wiki cc100 hplt3 arlis opensubtitles "
+                             "culturax mc4 glot500 ccnews_2023 ccnews_2024. "
                              "QA: armbench aya")
     parser.add_argument("--workers", type=int, default=5,
                         help="Max parallel HF downloads (corpus mode only; default: 5)")
