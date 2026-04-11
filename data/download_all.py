@@ -16,13 +16,21 @@ Usage:
 import os
 import sys
 import gc
+import bz2
+import re
 import time
 import shutil
 import argparse
+import urllib.request
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 RAW_FILE = os.path.join(DATA_DIR, "raw_text.txt")
+DUMP_FILE = os.path.join(DATA_DIR, "hywiki-latest-pages-articles.xml.bz2")
+WIKI_DUMP_URL = (
+    "https://dumps.wikimedia.org/hywiki/latest/"
+    "hywiki-latest-pages-articles.xml.bz2"
+)
 
 # HuggingFace cache location
 HF_CACHE = os.path.join(os.path.expanduser("~"), ".cache", "huggingface")
@@ -61,6 +69,84 @@ def get_file_size_mb(path):
 # Wikipedia
 # ---------------------------------------------------------------------------
 
+def _download_wiki_dump():
+    """Download the Armenian Wikipedia dump if not already present."""
+    if os.path.exists(DUMP_FILE):
+        print(f"  Dump already downloaded: {DUMP_FILE}")
+        return
+
+    print(f"  Downloading Armenian Wikipedia dump (~500 MB)...")
+
+    def progress_hook(block_num, block_size, total_size):
+        downloaded = block_num * block_size
+        if total_size > 0:
+            percent = min(100, downloaded * 100 / total_size)
+            mb = downloaded / (1024 * 1024)
+            total_mb = total_size / (1024 * 1024)
+            sys.stdout.write(f"\r    {percent:.1f}% ({mb:.1f}/{total_mb:.1f} MB)")
+            sys.stdout.flush()
+
+    urllib.request.urlretrieve(WIKI_DUMP_URL, DUMP_FILE, reporthook=progress_hook)
+    print()
+
+
+def _strip_wiki_markup(text):
+    """Remove MediaWiki markup, keeping plain Armenian content."""
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\{\{[^}]*\}\}", "", text)
+    text = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]*)\]\]", r"\1", text)
+    text = re.sub(r"\[https?://\S+\s*([^\]]*)\]", r"\1", text)
+    text = re.sub(r"\[\[(?:Категория|Category|Պատկdelays|File|Файл|Image):[^\]]*\]\]", "", text)
+    text = re.sub(r"'{2,}", "", text)
+    text = re.sub(r"={2,}(.+?)={2,}", r"\1", text)
+    text = re.sub(r"<ref[^>]*>.*?</ref>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<ref[^/]*/?>", "", text)
+    text = re.sub(r"&[a-zA-Z]+;", " ", text)
+    text = re.sub(r"&#\d+;", " ", text)
+    text = re.sub(r"\{\|[\s\S]*?\|\}", "", text)
+    text = re.sub(r"^\s*[|!].*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    text = re.sub(r"^\s*[*#:;]+\s*$", "", text, flags=re.MULTILINE)
+    return text.strip()
+
+
+def _extract_wiki_articles(dump_path):
+    """Yield cleaned article bodies from the bz2 Wikipedia XML dump."""
+    current_text = []
+    in_text = False
+    article_count = 0
+
+    with bz2.open(dump_path, "rt", encoding="utf-8") as f:
+        for line in f:
+            if "<text" in line:
+                in_text = True
+                match = re.search(r"<text[^>]*>(.*)", line)
+                if match:
+                    current_text.append(match.group(1))
+                continue
+
+            if in_text:
+                if "</text>" in line:
+                    current_text.append(line.split("</text>")[0])
+                    full_text = "\n".join(current_text)
+                    current_text = []
+                    in_text = False
+
+                    if full_text.startswith("#REDIRECT") or \
+                       full_text.startswith("#ՎԵՐԱՀՂՈՒՄ") or \
+                       len(full_text) < 200:
+                        continue
+
+                    cleaned = _strip_wiki_markup(full_text)
+                    if len(cleaned) > 100:
+                        article_count += 1
+                        if article_count % 10000 == 0:
+                            print(f"    Extracted {article_count} articles...")
+                        yield cleaned
+
+    print(f"  Total articles extracted: {article_count}")
+
+
 def download_wikipedia():
     """Download Armenian Wikipedia and extract articles."""
     marker = os.path.join(DATA_DIR, ".wiki_done")
@@ -69,15 +155,12 @@ def download_wikipedia():
         print("  Wikipedia: already done, skipping.")
         return out_file
 
-    sys.path.insert(0, DATA_DIR)
-    from download import download_dump, extract_articles, DUMP_FILE
-
-    download_dump()
+    _download_wiki_dump()
 
     print("  Extracting articles...")
     chars = 0
     with open(out_file, "w", encoding="utf-8", buffering=IO_BUFFER) as out:
-        for article_text in extract_articles(DUMP_FILE):
+        for article_text in _extract_wiki_articles(DUMP_FILE):
             out.write(article_text)
             out.write("\n\n")
             chars += len(article_text)
