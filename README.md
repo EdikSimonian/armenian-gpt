@@ -395,14 +395,19 @@ Downloaded automatically by `data/download.py`.
 
 ### Pre-cleaned Dataset (Recommended)
 
-A pre-cleaned, deduplicated Armenian text corpus (~29 GB) is available on HuggingFace. This skips the download and cleaning steps entirely:
+A pre-cleaned, deduplicated Armenian text corpus is published on HuggingFace as [**edisimon/armenian-clean-text**](https://huggingface.co/datasets/edisimon/armenian-clean-text). Grabbing it lets you skip steps 1 and 2 entirely.
+
+- **Size:** ~29 GB of clean text (~17B characters)
+- **License:** CC-BY-4.0
+- **Processing:** NFC-normalized, deduplicated at the paragraph level (MD5), stripped of non-Armenian characters, whitespace and blank lines collapsed
+- **Sources:** Armenian Wikipedia, CC-100, CulturaX, OSCAR-2301, mC4, HPLT v2.0, Glot500 (see the table below for details)
 
 ```bash
 pip install huggingface_hub
 python -c "from huggingface_hub import hf_hub_download; hf_hub_download(repo_id='edisimon/armenian-clean-text', filename='clean_text.txt', repo_type='dataset', local_dir='data/')"
 ```
 
-Then go straight to tokenization: `python data/prepare.py --tokenizer bpe`
+Then go straight to tokenization: `python 3_tokenize.py --tokenizer bpe`
 
 ### Optional: Additional Data Sources
 
