@@ -1,12 +1,8 @@
-# Data files (too large for git)
-data/*.bin
-data/*.txt
-data/*.bz2
-data/*.model
-data/*.vocab
-data/*.json
-data/.*_done
-data/qa_parts/
+# Data directory — all artifacts (raw text, tokenized bins, tokenizer JSON,
+# SFT sources, etc.) live here and are regenerable. Everything inside is
+# ignored; keep the directory itself via a .gitkeep if needed.
+data/*
+!data/.gitkeep
 data_chat/
 
 # Pipeline logs
