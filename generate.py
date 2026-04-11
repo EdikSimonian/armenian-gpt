@@ -55,7 +55,7 @@ def main():
     # Load checkpoint
     if not os.path.exists(args.checkpoint):
         print(f"Error: checkpoint not found at {args.checkpoint}")
-        print("Train a model first with: python train.py")
+        print("Train a model first with: python 4_train.py")
         return
 
     print(f"Loading model from {args.checkpoint}...")

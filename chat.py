@@ -29,7 +29,7 @@ def load_tokenizer(data_dir, tokenizer_type=None):
         return _load_tokenizer(data_dir, tokenizer_type)
     except (FileNotFoundError, ValueError) as e:
         print(f"Error: {e}")
-        print("Run 'python data/prepare_chat.py' first.")
+        print("Run 'python data/prepare_chat.py' then 'python 5_finetune.py' first.")
         sys.exit(1)
 
 
@@ -54,8 +54,8 @@ def main():
     if not os.path.exists(args.checkpoint):
         print(f"Error: checkpoint not found at {args.checkpoint}")
         print("Fine-tune a model first:")
-        print("  1. python data/prepare_chat.py")
-        print("  2. python finetune.py")
+        print("  1. python data/prepare_chat.py --source <sft.json>")
+        print("  2. python 5_finetune.py")
         sys.exit(1)
 
     print("Loading model...")

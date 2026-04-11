@@ -1,19 +1,20 @@
 """
-ArmGPT Training Script
+Step 4: Pretrain ArmGPT on Armenian text.
 
-Trains the GPT model on Armenian text data.
+Trains the GPT model on the tokenized corpus produced by 3_tokenize.py.
 
 Usage:
-    python train.py                     # train with default "small" config
-    python train.py --preset tiny       # quick test on CPU
-    python train.py --preset medium     # better results, needs GPU
-    python train.py --resume_from checkpoints/step_1000.pt  # resume training
+    python 4_train.py --preset small --tokenizer bpe            # default config
+    python 4_train.py --preset tiny --tokenizer char            # quick CPU test
+    python 4_train.py --preset xlarge --tokenizer bpe           # A100/H100
+    python 4_train.py --preset xlarge --tokenizer bpe \
+        --resume_from checkpoints/step_1000.pt                  # resume
 
-What happens during training:
-    1. Load the prepared data (data/train_{char|bpe}.bin and data/val_*.bin)
-    2. Create the GPT model
-    3. Repeatedly: grab a batch of text, predict next tokens, learn from mistakes
-    4. Every N steps: check validation loss, generate sample text, save checkpoint
+Inputs:
+    data/train_{char|bpe}.bin, data/val_{char|bpe}.bin, data/tokenizer_*.json
+
+Outputs:
+    checkpoints/step_*.pt, checkpoints/final.pt, checkpoints/metrics.json
 """
 
 import os
@@ -45,7 +46,7 @@ def load_data(data_dir, tokenizer_type, device):
 
     if not os.path.exists(train_path):
         print(f"Error: {train_path} not found!")
-        print(f"Run 'python data/prepare.py --tokenizer {tokenizer_type}' first.")
+        print(f"Run 'python 3_tokenize.py --tokenizer {tokenizer_type}' first.")
         sys.exit(1)
 
     # Memory-map to avoid loading multi-GB datasets into RAM
@@ -63,7 +64,7 @@ def load_tokenizer(data_dir, tokenizer_type):
     path = tokenizer_path(data_dir, tokenizer_type)
     if not os.path.exists(path):
         print(f"Error: {path} not found! "
-              f"Run data/prepare.py --tokenizer {tokenizer_type} first.")
+              f"Run 3_tokenize.py --tokenizer {tokenizer_type} first.")
         sys.exit(1)
     return _load(data_dir, tokenizer_type)
 

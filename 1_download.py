@@ -1,5 +1,5 @@
 """
-Download all Armenian text data sources and merge into raw_text.txt.
+Step 1: Download all Armenian text data sources and merge into raw_text.txt.
 
 Optimized for fast parallel downloads on machines with ample RAM (32+ GB).
 HuggingFace sources download in parallel to separate files, then merge.
@@ -8,9 +8,12 @@ Requirements:
     pip install datasets requests mwxml
 
 Usage:
-    python data/download_all.py              # download all sources
-    python data/download_all.py --skip wiki  # skip specific sources
-    python data/download_all.py --workers 3  # limit parallel HF downloads
+    python 1_download.py              # download all sources
+    python 1_download.py --skip wiki  # skip specific sources
+    python 1_download.py --workers 3  # limit parallel HF downloads
+
+Output:
+    data/raw_text.txt  — concatenated raw Armenian text (~30 GB)
 """
 
 import os
@@ -24,7 +27,8 @@ import argparse
 import urllib.request
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
-DATA_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+os.makedirs(DATA_DIR, exist_ok=True)
 RAW_FILE = os.path.join(DATA_DIR, "raw_text.txt")
 DUMP_FILE = os.path.join(DATA_DIR, "hywiki-latest-pages-articles.xml.bz2")
 WIKI_DUMP_URL = (
@@ -485,7 +489,7 @@ def main():
     print(f"{'='*60}")
     print(f"  raw_text.txt: {final_size:.0f} MB ({final_size / 1024:.1f} GB)")
     print(f"  Total time:   {fmt_time(elapsed)}")
-    print(f"\n  Next step: python data/prepare.py --tokenizer bpe")
+    print(f"\n  Next step: python 2_prepare.py")
 
 
 if __name__ == "__main__":

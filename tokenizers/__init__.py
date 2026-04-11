@@ -44,7 +44,7 @@ def detect_tokenizer_type(data_dir):
         return "bpe"
     raise FileNotFoundError(
         f"No tokenizer_char.json or tokenizer_bpe.json in {data_dir}. "
-        "Run data/prepare.py first."
+        "Run 3_tokenize.py first."
     )
 
 

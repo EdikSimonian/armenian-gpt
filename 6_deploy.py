@@ -1,24 +1,26 @@
 """
-Upload a trained ArmGPT model to HuggingFace Hub.
+Step 6: Deploy a trained ArmGPT model to HuggingFace Hub.
 
-Converts the PyTorch checkpoint to HuggingFace-compatible format
-and uploads it along with the tokenizer and model card.
+Converts the PyTorch checkpoint to a HuggingFace-compatible bundle and
+uploads it along with the tokenizer and a model card.
 
 Requirements:
     pip install huggingface_hub
+    huggingface-cli login   # one-time
 
 Usage:
-    # First login (one-time):
-    huggingface-cli login
+    python 6_deploy.py --repo your-username/armgpt
+    python 6_deploy.py --repo your-username/armgpt --checkpoint checkpoints/step_50000.pt
+    python 6_deploy.py --repo your-username/armgpt \
+        --checkpoint checkpoints/final.pt \
+        --chat_checkpoint checkpoints_chat/final.pt
 
-    # Upload with defaults:
-    python upload_to_hf.py --repo your-username/armgpt
+Inputs:
+    checkpoints/final.pt (or specified checkpoint)
+    data/tokenizer_{char|bpe}.json  (picked via --tokenizer or auto-detect)
 
-    # Upload a specific checkpoint:
-    python upload_to_hf.py --repo your-username/armgpt --checkpoint checkpoints/step_50000.pt
-
-    # Include chat-finetuned model too:
-    python upload_to_hf.py --repo your-username/armgpt --checkpoint checkpoints/final.pt --chat_checkpoint checkpoints_chat/final.pt
+Output:
+    Uploaded files at https://huggingface.co/<repo>
 """
 
 import argparse
