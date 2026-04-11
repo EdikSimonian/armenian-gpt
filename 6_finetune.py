@@ -1,20 +1,28 @@
 """
-Stage 2: Fine-tune ArmGPT on Conversational Data
+Step 6: Fine-tune ArmGPT on conversational data (Stage 2 SFT).
 
-This script takes a base model trained on Wikipedia (Stage 1) and fine-tunes
-it on instruction/response pairs so it can answer questions like a chatbot.
-
-This is how real AI assistants like ChatGPT are made:
-    Stage 1: Train on lots of text (Wikipedia) -> learns language patterns
-    Stage 2: Fine-tune on conversations (this script) -> learns to be helpful
+Takes a base model produced by 4_train.py and fine-tunes it on
+instruction/response pairs from data_chat/ (produced by
+3_tokenize.py --qa).
 
 Usage:
-    python finetune.py
-    python finetune.py --stage1_checkpoint checkpoints/final.pt
-    python finetune.py --max_iters 3000 --learning_rate 1e-4
+    python 6_finetune.py
+    python 6_finetune.py --stage1_checkpoint checkpoints/final.pt
+    python 6_finetune.py --max_iters 3000 --learning_rate 1e-4
+    RESUME_CHAT_FROM=checkpoints_chat/chat_best.pt python 6_finetune.py
 
-After running, use chat.py to talk to your model:
-    python chat.py
+Inputs:
+    data_chat/train_{char,bpe}.bin, val_{char,bpe}.bin, tokenizer_{char,bpe}.json
+    checkpoints/final.pt   (Stage 1 base model, cold start only)
+
+Outputs:
+    checkpoints_chat/chat_step_*.pt   (periodic snapshots)
+    checkpoints_chat/chat_best.pt     (best val loss so far)
+    checkpoints_chat/chat_final.pt    (end-of-run)
+    Uploaded to checkpoints/chat/ on the configured HF repo.
+
+After running, use 8_chat.py to talk to your model:
+    python 8_chat.py
 """
 
 import os
@@ -106,9 +114,9 @@ def save_and_upload_chat_checkpoint(model, optimizer, step, cfg, local_name,
     contributing factor to the macOS jetsam SIGTERM at step 2000 of the
     original run (two ~4 GB files held concurrently in upload threads).
 
-    On the FIRST call we also upload the chat tokenizer (data_chat/tokenizer.json)
-    so the Space can decode the new <|user|>/<|assistant|>/<|end|> tokens that
-    the base repo's tokenizer doesn't know about.
+    On the FIRST call we also upload the chat tokenizer so the Space can
+    decode the new <|user|>/<|assistant|>/<|end|> tokens that the base repo's
+    tokenizer doesn't know about.
     """
     global _HF_CHAT_TOKENIZER_UPLOADED
 
@@ -123,11 +131,12 @@ def save_and_upload_chat_checkpoint(model, optimizer, step, cfg, local_name,
 
     # First upload also ships the chat tokenizer (once per run).
     if not _HF_CHAT_TOKENIZER_UPLOADED:
-        chat_tok_path = os.path.join("data_chat", "tokenizer.json")
+        from tokenizers import tokenizer_path as _tok_path
+        chat_tok_path = _tok_path("data_chat", cfg["tokenizer"])
         if os.path.exists(chat_tok_path):
             _hf_upload_bg(
                 chat_tok_path,
-                "data_chat/tokenizer.json",
+                f"data_chat/tokenizer_{cfg['tokenizer']}.json",
                 f"Chat tokenizer (step {step})",
             )
             _HF_CHAT_TOKENIZER_UPLOADED = True
@@ -139,14 +148,14 @@ def save_and_upload_chat_checkpoint(model, optimizer, step, cfg, local_name,
     )
 
 
-def load_data(data_dir):
-    """Load the chat training and validation data."""
-    train_path = os.path.join(data_dir, "train.bin")
-    val_path = os.path.join(data_dir, "val.bin")
+def load_data(data_dir, tokenizer_type):
+    """Load the chat training and validation data for the given tokenizer."""
+    from tokenizers import bin_paths
+    train_path, val_path = bin_paths(data_dir, tokenizer_type)
 
     if not os.path.exists(train_path):
         print(f"Error: {train_path} not found!")
-        print("Run 'python data/prepare_chat.py' first.")
+        print(f"Run 'python 3_tokenize.py --qa --tokenizer {tokenizer_type}' first.")
         sys.exit(1)
 
     train_data = np.memmap(train_path, dtype=np.uint16, mode="r")
@@ -154,22 +163,15 @@ def load_data(data_dir):
     return train_data, val_data
 
 
-def load_tokenizer(data_dir):
+def load_tokenizer(data_dir, tokenizer_type):
     """Load the extended tokenizer with special chat tokens."""
-    tok_path = os.path.join(data_dir, "tokenizer.json")
+    from tokenizers import load_tokenizer as _load, tokenizer_path
+    tok_path = tokenizer_path(data_dir, tokenizer_type)
     if not os.path.exists(tok_path):
-        print(f"Error: {tok_path} not found! Run data/prepare_chat.py first.")
+        print(f"Error: {tok_path} not found! "
+              f"Run 3_tokenize.py --qa --tokenizer {tokenizer_type} first.")
         sys.exit(1)
-
-    with open(tok_path, "r", encoding="utf-8") as f:
-        tok_data = json.load(f)
-
-    if tok_data["type"] == "char":
-        from tokenizers.char_tokenizer import CharTokenizer
-        return CharTokenizer.load(tok_path)
-    else:
-        from tokenizers.bpe_tokenizer import BPETokenizer
-        return BPETokenizer.load(tok_path)
+    return _load(data_dir, tokenizer_type)
 
 
 def get_batch(data, block_size, batch_size, device):
@@ -242,8 +244,8 @@ def main():
     print(f"{'='*50}\n")
 
     # Load chat data and tokenizer
-    train_data, val_data = load_data(chat_data_dir)
-    tokenizer = load_tokenizer(chat_data_dir)
+    train_data, val_data = load_data(chat_data_dir, cfg["tokenizer"])
+    tokenizer = load_tokenizer(chat_data_dir, cfg["tokenizer"])
     print(f"Chat train data: {len(train_data):,} tokens")
     print(f"Chat val data:   {len(val_data):,} tokens")
     print(f"Vocab size:      {tokenizer.vocab_size} (with special tokens)")
@@ -311,7 +313,7 @@ def main():
         # ---- COLD START PATH (load base + graft chat tokens) -----------------
         if not os.path.exists(stage1_ckpt):
             print(f"\nError: Stage 1 checkpoint not found at {stage1_ckpt}")
-            print("Train Stage 1 first with: python train.py --preset small")
+            print("Train Stage 1 first with: python 4_train.py --preset small")
             sys.exit(1)
 
         print(f"\nLoading Stage 1 model from {stage1_ckpt}...")
@@ -354,7 +356,7 @@ def main():
         model.load_state_dict(model_state)
         print(f"  Loaded Stage 1 weights (vocab: {old_vocab_size} -> {new_vocab_size})")
 
-        # Use Stage 1 model architecture in config so chat.py can rebuild the model.
+        # Use Stage 1 model architecture in config so 8_chat.py can rebuild the model.
         cfg["vocab_size"] = new_vocab_size
         cfg["n_layer"] = stage1_cfg["n_layer"]
         cfg["n_head"] = stage1_cfg["n_head"]
@@ -522,7 +524,7 @@ def main():
         _upload_queue.join()
         print(f"  All uploads complete.", flush=True)
 
-    print(f"\n  Chat with your model: python chat.py")
+    print(f"\n  Chat with your model: python 8_chat.py")
 
 
 if __name__ == "__main__":
