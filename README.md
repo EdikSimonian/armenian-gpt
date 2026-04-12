@@ -198,14 +198,42 @@ python 8_chat.py --temperature 0.5 --max_length 500
 
 ## Model Presets
 
-| Preset | Params | Layers | Dim | Context | Steps | Target GPU |
-|--------|--------|--------|-----|---------|-------|------------|
-| `tiny` | ~0.2M | 1 | 64 | 64 | 1K | CPU |
-| `small` | ~10M | 6 | 384 | 256 | 5K | GTX 1080 Ti / T4 |
-| `medium` | ~30M | 8 | 512 | 512 | 10K | A100 / V100 |
-| `large` | ~85M | 12 | 768 | 512 | 20K | RTX 4090 |
-| `xlarge` | ~350M | 24 | 1024 | 1024 | 36K | A40 / H100 |
-| `giant` | ~1B | 32 | 1536 | 2048 | 122K | H200 |
+| Preset | Params | Layers | Dim | Context | Steps | Est. Time (RTX 4090) | Target GPU |
+|--------|--------|--------|-----|---------|-------|----------------------|------------|
+| `tiny` | ~0.2M | 1 | 64 | 64 | 1K | < 1 min | CPU |
+| `small` | ~10M | 6 | 384 | 256 | 5K | ~10 min | Any GPU |
+| `medium` | ~30M | 8 | 512 | 512 | 10K | ~1 hr | T4 / 1080 Ti |
+| `large` | ~85M | 12 | 768 | 512 | 20K | ~3 hrs | RTX 4090 |
+| `xlarge` | ~350M | 24 | 1024 | 1024 | 36K | ~8 hrs | RTX 4090 / A40 |
+| `giant` | ~1B | 32 | 1536 | 2048 | 122K | ~48 hrs | A40 / H100 / H200 |
+
+**What to pick for an RTX 4090 with 8 hours:**
+- **`xlarge`** is the sweet spot -- 350M parameters, completes in roughly 8 hours.
+- **`large`** finishes in ~3 hours, leaving time for fine-tuning + chat testing in the same session.
+- **`giant`** won't fit in 8 hours on a 4090 (needs ~48 hrs or a larger GPU).
+
+---
+
+## Pause and Resume Training
+
+Training saves checkpoints automatically (every 1000 steps by default). You can stop at any time with `Ctrl+C` and resume later from the last checkpoint:
+
+```bash
+# Start training
+python 4_train.py --preset xlarge --tokenizer bpe
+
+# ... Ctrl+C to stop ...
+
+# Resume from the latest checkpoint
+python 4_train.py --preset xlarge --tokenizer bpe --resume_from checkpoints/step_5000.pt
+```
+
+Each checkpoint contains the model weights, optimizer state, step number, and config, so training continues exactly where it left off (same learning rate schedule, etc.).
+
+Fine-tuning resumes similarly:
+```bash
+RESUME_CHAT_FROM=checkpoints_chat/chat_best.pt python 6_finetune.py --tokenizer bpe
+```
 
 ---
 
