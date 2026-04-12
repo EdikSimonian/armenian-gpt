@@ -74,7 +74,8 @@ def main():
     state = checkpoint["model"]
     cfg["n_embd"] = state["transformer.wte.weight"].shape[1]
     cfg["n_layer"] = max(int(k.split(".")[2]) for k in state if k.startswith("transformer.blocks.")) + 1
-    cfg["block_size"] = state["transformer.blocks.0.attn.bias"].shape[-1]
+    if "transformer.blocks.0.attn.bias" in state:
+        cfg["block_size"] = state["transformer.blocks.0.attn.bias"].shape[-1]
 
     # Determine device
     if torch.cuda.is_available():
