@@ -105,6 +105,35 @@ PRESETS = {
         save_interval=2000,  # 84 HF uploads across the run vs 168 at 1000
         sample_interval=4000,
     ),
+    # ~1.0 B params. Bigger than xxlarge — approaches the data ceiling
+    # for the ~16 B-token Armenian corpus. Chinchilla-optimal for 1 B is
+    # 20 B tokens, so with max_iters=84000 × eff_batch 128 × ctx 2048 =
+    # ~22 B tokens seen (~22 tokens/param), we're ~10% over Chinchilla-
+    # optimal — ideal for quality without wasting compute.
+    #
+    # Needs ≥80 GB VRAM for training with 8-bit AdamW. Tight on 48 GB
+    # (A40/A6000) even with gradient checkpointing. Sweet spot is one
+    # A100 80GB or H100 80GB. Expected ~92 h on H100 at ~40% MFU in BF16
+    # (~$180 on Vast.ai H100 spot at $2/hr).
+    #
+    # Above 1.5 B params the ratio of param-to-data gets ugly for our
+    # corpus — model capacity exceeds what the data can teach. If you
+    # need to go bigger, switch to continued-pretraining on a multi-
+    # lingual base model (Qwen-2.5-7B) instead of from-scratch.
+    "giant": dict(
+        n_layer=32,
+        n_head=24,
+        n_embd=1536,         # 24 × 64 head_dim
+        block_size=2048,
+        batch_size=8,
+        grad_accum_steps=16, # effective batch = 8*16 = 128
+        max_iters=84000,     # ~22 B tokens seen, ~22 tok/param
+        learning_rate=2e-4,  # slightly lower than xxlarge for bigger model
+        warmup_iters=2000,
+        eval_interval=2000,
+        save_interval=2000,
+        sample_interval=4000,
+    ),
     # Stage 2: fine-tuning on conversational data
     "finetune": dict(
         n_layer=6,
@@ -163,7 +192,7 @@ def get_config():
     parser = argparse.ArgumentParser(description="ArmGPT Training Config")
     parser.add_argument("--preset", type=str, default=None,
                         choices=["tiny", "small", "medium", "large", "xlarge",
-                                 "xxlarge", "xxlarge_4epoch", "finetune"],
+                                 "xxlarge", "xxlarge_4epoch", "giant", "finetune"],
                         help="Use a preset configuration")
     # Allow overriding any config value from the command line
     parser.add_argument("--n_layer", type=int, default=None)
