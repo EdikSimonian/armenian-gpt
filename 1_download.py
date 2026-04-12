@@ -165,7 +165,7 @@ def _commit_source(name, src_path):
         raise RuntimeError(f"[{name}] source file missing: {src_path}")
     size_mb = os.path.getsize(src_path) / (1024 * 1024)
     _write_marker(name)
-    print(f"  [{name}] Done ({size_mb:.0f} MB) → kept as "
+    print(f"  [{name}] Done ({size_mb:.0f} MB) -> kept as "
           f"{os.path.basename(src_path)}")
 
 
@@ -606,7 +606,7 @@ def download_arlis():
         urllib.request.urlretrieve(ARLIS_URL, arlis_xz, reporthook=progress)
         print("\n  Download complete!")
 
-    print("  Extracting ARLIS documents (HTML → plain text)...")
+    print("  Extracting ARLIS documents (HTML -> plain text)...")
     docs = 0
     chars = 0
     t0 = time.time()
@@ -1655,7 +1655,7 @@ _ARMBENCH_PROCESSORS = {
 def fetch_armbench_qa(train_output_path, eval_output_path):
     """Fetch ArmBench native Armenian Q&A and write train/eval JSON files."""
     print("=" * 60)
-    print("  ArmBench → Q&A normalizer")
+    print("  ArmBench -> Q&A normalizer")
     print("=" * 60)
 
     train_pairs = []
@@ -1679,11 +1679,11 @@ def fetch_armbench_qa(train_output_path, eval_output_path):
 
     with open(train_output_path, "w", encoding="utf-8") as f:
         json.dump(train_pairs, f, ensure_ascii=False, indent=2)
-    print(f"  Saved train → {train_output_path}")
+    print(f"  Saved train -> {train_output_path}")
 
     with open(eval_output_path, "w", encoding="utf-8") as f:
         json.dump(eval_pairs, f, ensure_ascii=False, indent=2)
-    print(f"  Saved eval  → {eval_output_path}")
+    print(f"  Saved eval  -> {eval_output_path}")
 
     return len(train_pairs), len(eval_pairs)
 
@@ -1877,7 +1877,7 @@ def fetch_aya_qa(
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(unique, f, ensure_ascii=False, indent=2)
-    print(f"\n  Saved → {output_path}")
+    print(f"\n  Saved -> {output_path}")
 
     return len(unique)
 
@@ -2118,24 +2118,27 @@ def _compress_zstd(src_path, dst_path, level=12):
     total_out = os.path.getsize(dst_path)
     elapsed = time.time() - t0
     ratio = total_in / total_out if total_out else 0
-    print(f"  zstd L{level}: {total_in / 1024 ** 3:.2f} GB → "
+    print(f"  zstd L{level}: {total_in / 1024 ** 3:.2f} GB -> "
           f"{total_out / 1024 ** 3:.2f} GB "
-          f"({ratio:.1f}× ratio) in {fmt_time(elapsed)}")
+          f"({ratio:.1f}x ratio) in {fmt_time(elapsed)}")
     return total_in, total_out
 
 
 def _decompress_zstd(src_path, dst_path):
-    """Decompress a zstd file to a plain output file (streaming)."""
+    """Decompress a zstd file to a plain output file (streaming).
+
+    Uses 64 MB I/O buffers for maximum throughput on NVMe/SSD storage.
+    """
     import zstandard as zstd
 
     dctx = zstd.ZstdDecompressor()
     t0 = time.time()
     with open(src_path, "rb") as fin, open(dst_path, "wb") as fout:
-        dctx.copy_stream(fin, fout, read_size=16 * 1024 * 1024,
-                         write_size=16 * 1024 * 1024)
+        dctx.copy_stream(fin, fout, read_size=64 * 1024 * 1024,
+                         write_size=64 * 1024 * 1024)
     total_out = os.path.getsize(dst_path)
     elapsed = time.time() - t0
-    print(f"  unzstd: {os.path.getsize(src_path) / 1024 ** 3:.2f} GB → "
+    print(f"  unzstd: {os.path.getsize(src_path) / 1024 ** 3:.2f} GB -> "
           f"{total_out / 1024 ** 3:.2f} GB in {fmt_time(elapsed)}")
 
 
@@ -2289,7 +2292,7 @@ def upload_dataset_to_hf(repo_id, corpus_path, finetune_dir, token=None):
         print(f"  LFS orphan cleanup skipped: {e}")
 
     print(f"\n{'='*60}")
-    print(f"  Done → https://huggingface.co/datasets/{repo_id}")
+    print(f"  Done -> https://huggingface.co/datasets/{repo_id}")
     print(f"{'='*60}")
 
 
@@ -2345,7 +2348,7 @@ def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None):
     print(f"  Downloaded: {zst_path}")
 
     print(f"\n{'='*60}")
-    print(f"  Step 2/3: Decompressing → {train_dir}/clean_text.txt")
+    print(f"  Step 2/3: Decompressing -> {train_dir}/clean_text.txt")
     print(f"{'='*60}")
     clean_out = os.path.join(train_dir, "clean_text.txt")
     _decompress_zstd(zst_path, clean_out)
