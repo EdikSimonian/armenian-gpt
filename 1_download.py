@@ -1948,6 +1948,7 @@ DEFAULT_HF_DATASET_REPO = "edisimon/armenian-clean-text"
 
 HF_CORPUS_PATH = "corpus/clean_text.txt.zst"
 HF_FINETUNE_DIR = "finetune"
+HF_TOKENIZED_DIR = "tokenized"
 
 # Source inventory used by _build_hf_readme. Keeps the README and the
 # actual source list in sync — add an entry here whenever a new source
@@ -2142,13 +2143,18 @@ def _decompress_zstd(src_path, dst_path):
           f"{total_out / 1024 ** 3:.2f} GB in {fmt_time(elapsed)}")
 
 
-def upload_dataset_to_hf(repo_id, corpus_path, finetune_dir, token=None):
+def upload_dataset_to_hf(repo_id, corpus_path, finetune_dir, token=None,
+                         tokenized=False, data_dir=None):
     """Upload the clean corpus + Q&A bundle to a HF dataset repo.
 
     Layout written to the repo (existing unrelated files are deleted):
         README.md
         corpus/clean_text.txt.zst
         finetune/*.json
+        tokenized/train_bpe.bin.zst   (if --tokenized)
+        tokenized/val_bpe.bin.zst     (if --tokenized)
+        tokenized/tokenizer_bpe.json  (if --tokenized)
+        tokenized/bpe_model.model     (if --tokenized)
 
     Uses ``HfApi.upload_folder`` with ``delete_patterns=["*"]`` which tells
     HF to remove any existing files not part of this upload. After upload
@@ -2233,6 +2239,26 @@ def upload_dataset_to_hf(repo_id, corpus_path, finetune_dir, token=None):
             except Exception:
                 pass
 
+        # Stage tokenized bins (compressed) if requested
+        if tokenized and data_dir:
+            stage_tokenized = os.path.join(staging, "tokenized")
+            os.makedirs(stage_tokenized, exist_ok=True)
+            # Large bins: compress with zstd
+            for name in ("train_bpe.bin", "val_bpe.bin"):
+                src = os.path.join(data_dir, name)
+                if not os.path.exists(src):
+                    print(f"  Warning: {src} not found, skipping")
+                    continue
+                dst = os.path.join(stage_tokenized, name + ".zst")
+                print(f"\n  Compressing {name}...")
+                _compress_zstd(src, dst, level=3)
+            # Small files: copy as-is
+            for name in ("tokenizer_bpe.json", "bpe_model.model"):
+                src = os.path.join(data_dir, name)
+                if os.path.exists(src):
+                    shutil.copy2(src, os.path.join(stage_tokenized, name))
+                    print(f"  {name}")
+
         readme = _build_hf_readme(
             corpus_stats={
                 "uncompressed_gb": raw_size / 1024 ** 3,
@@ -2312,12 +2338,17 @@ def _lfs_orphan_cleanup(api, repo_id):
     print(f"  Done.")
 
 
-def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None):
+def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None,
+                             tokenized=False, data_dir=None):
     """Fetch the published corpus + Q&A bundle back into data/text/{train,finetune}/.
 
     This is the counterpart to ``--upload``: reconstructs the local
     layout exactly as ``2_prepare.py`` would leave it, so downstream
     steps (3_tokenize.py, training) run unchanged.
+
+    If ``tokenized=True``, also fetches pre-tokenized BPE bins from
+    tokenized/ in the repo and decompresses them into data_dir, so
+    you can skip 3_tokenize.py entirely.
     """
     from huggingface_hub import HfApi, hf_hub_download, get_token
 
@@ -2375,6 +2406,40 @@ def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None):
         shutil.copy2(local_path, target)
         print(f"  {os.path.basename(hf_path)}")
 
+    # Fetch pre-tokenized BPE bins if requested
+    if tokenized and data_dir:
+        print(f"\n{'='*60}")
+        print(f"  Step 4: Fetching pre-tokenized BPE data")
+        print(f"{'='*60}")
+        os.makedirs(data_dir, exist_ok=True)
+
+        # Compressed bins
+        for name in ("train_bpe.bin.zst", "val_bpe.bin.zst"):
+            hf_path = f"{HF_TOKENIZED_DIR}/{name}"
+            try:
+                cached = hf_hub_download(
+                    repo_id=repo_id, filename=hf_path,
+                    repo_type="dataset", token=token, cache_dir=HF_CACHE_DIR,
+                )
+                out_path = os.path.join(data_dir, name.removesuffix(".zst"))
+                print(f"  Decompressing {name}...")
+                _decompress_zstd(cached, out_path)
+            except Exception as e:
+                print(f"  Warning: could not fetch {hf_path}: {e}")
+
+        # Small files (tokenizer json, sentencepiece model)
+        for name in ("tokenizer_bpe.json", "bpe_model.model"):
+            hf_path = f"{HF_TOKENIZED_DIR}/{name}"
+            try:
+                cached = hf_hub_download(
+                    repo_id=repo_id, filename=hf_path,
+                    repo_type="dataset", token=token, cache_dir=HF_CACHE_DIR,
+                )
+                shutil.copy2(cached, os.path.join(data_dir, name))
+                print(f"  {name}")
+            except Exception as e:
+                print(f"  Warning: could not fetch {hf_path}: {e}")
+
     # Write a sentinel so reruns of 1_download.py know everything was
     # fetched from HF and nothing needs re-downloading from source.
     with open(os.path.join(train_dir, ".downloaded_from_hf"), "w") as f:
@@ -2385,8 +2450,13 @@ def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None):
     print(f"{'='*60}")
     print(f"  Corpus:   {clean_out}")
     print(f"  Q&A dir:  {finetune_dir}")
-    print()
-    print(f"  Next step: python 3_tokenize.py --tokenizer bpe")
+    if tokenized:
+        print(f"  Tokenized: {data_dir}")
+        print()
+        print(f"  Next step: python 4_train.py --preset tiny --tokenizer bpe")
+    else:
+        print()
+        print(f"  Next step: python 3_tokenize.py --tokenizer bpe")
 
 
 # =============================================================================
@@ -2413,6 +2483,9 @@ def main():
     parser.add_argument("--download", action="store_true",
                         help="Fetch the published corpus + Q&A from HF instead of "
                              "running the full source-download pipeline")
+    parser.add_argument("--tokenized", action="store_true",
+                        help="Include pre-tokenized BPE bins in --upload/--download "
+                             "(train_bpe.bin, val_bpe.bin, tokenizer_bpe.json)")
     parser.add_argument("--hf-repo", type=str, default=DEFAULT_HF_DATASET_REPO,
                         help="Override the HF dataset repo for --upload/--download")
 
@@ -2424,6 +2497,8 @@ def main():
             repo_id=args.hf_repo,
             corpus_path=os.path.join(TEXT_TRAIN_DIR, "clean_text.txt"),
             finetune_dir=TEXT_FINETUNE_DIR,
+            tokenized=args.tokenized,
+            data_dir=DATA_DIR,
         )
         return
 
@@ -2432,6 +2507,8 @@ def main():
             repo_id=args.hf_repo,
             train_dir=TEXT_TRAIN_DIR,
             finetune_dir=TEXT_FINETUNE_DIR,
+            tokenized=args.tokenized,
+            data_dir=DATA_DIR,
         )
         return
 
