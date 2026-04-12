@@ -20,6 +20,11 @@ Outputs:
 import os
 import sys
 
+# Force UTF-8 stdout/stderr on Windows so Armenian text can be printed
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 # Force unbuffered output so logs appear immediately when piped
 os.environ["PYTHONUNBUFFERED"] = "1"
 
@@ -153,10 +158,14 @@ def main():
         dropout=cfg["dropout"],
     ).to(device)
 
-    # Compile model for faster training (PyTorch 2.0+)
+    # Compile model for faster training (PyTorch 2.0+, requires CC >= 7.0)
     if device == "cuda" and hasattr(torch, "compile"):
-        print("Compiling model with torch.compile()...")
-        model = torch.compile(model)
+        cc = torch.cuda.get_device_capability()
+        if cc[0] >= 7:
+            print("Compiling model with torch.compile()...")
+            model = torch.compile(model)
+        else:
+            print(f"Skipping torch.compile() (GPU compute capability {cc[0]}.{cc[1]} < 7.0)")
 
     # Create optimizer
     optimizer = torch.optim.AdamW(

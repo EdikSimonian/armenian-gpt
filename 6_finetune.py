@@ -27,6 +27,12 @@ After running, use 8_chat.py to talk to your model:
 
 import os
 import sys
+
+# Force UTF-8 stdout/stderr on Windows so Armenian text can be printed
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import time
 import json
 import math
@@ -42,7 +48,9 @@ from core.config import get_config
 # --- HF async upload helpers --------------------------------------------------
 # Finetune checkpoints go to checkpoints/chat/ on the model repo so the HF
 # Space loader can prefer them over the base pretraining checkpoints.
+# Uploads are OFF by default; pass --upload to enable.
 _HF_UPLOAD_REPO = os.environ.get("HF_UPLOAD_REPO", "edisimon/armgpt")
+_HF_UPLOAD_ENABLED = False  # set True by --upload flag in main()
 _HF_CHAT_TOKENIZER_UPLOADED = False  # one-shot flag (set from main thread only)
 
 # Single-worker upload queue. Why not fire-and-forget threads?
@@ -129,6 +137,9 @@ def save_and_upload_chat_checkpoint(model, optimizer, step, cfg, local_name,
     size_gb = os.path.getsize(local_path) / 1e9
     print(f"  [checkpoint] saved {local_path} ({size_gb:.2f} GB)", flush=True)
 
+    if not _HF_UPLOAD_ENABLED:
+        return
+
     # First upload also ships the chat tokenizer (once per run).
     if not _HF_CHAT_TOKENIZER_UPLOADED:
         from core import tokenizer_path as _tok_path
@@ -209,6 +220,22 @@ def get_lr(step, cfg):
 
 
 def main():
+    global _HF_UPLOAD_ENABLED, _HF_UPLOAD_REPO
+
+    # Parse --upload / --hf-repo before get_config() consumes the rest
+    import argparse as _ap
+    _pre = _ap.ArgumentParser(add_help=False)
+    _pre.add_argument("--upload", action="store_true",
+                      help="Upload checkpoints to HF during training")
+    _pre.add_argument("--hf-repo", type=str, default=None,
+                      help="HF model repo for uploads")
+    _pre_args, _remaining = _pre.parse_known_args()
+    sys.argv = [sys.argv[0]] + _remaining
+
+    _HF_UPLOAD_ENABLED = _pre_args.upload
+    if _pre_args.hf_repo:
+        _HF_UPLOAD_REPO = _pre_args.hf_repo
+
     # Parse config — default to finetune preset
     sys.argv = sys.argv or ["finetune.py"]
     # Insert --preset finetune as default if no preset specified
@@ -392,9 +419,9 @@ def main():
     print(f"\nStarting fine-tuning...")
     if start_step > 0:
         print(f"  RESUMING at step {start_step}, will run through step {cfg['max_iters']}")
-    print(f"  Periodic chat checkpoints every {chat_save_interval} steps → "
+    print(f"  Periodic chat checkpoints every {chat_save_interval} steps -> "
           f"checkpoints/chat/chat_step_NNNNN.pt on {_HF_UPLOAD_REPO}")
-    print(f"  Best checkpoint tracked on val loss → "
+    print(f"  Best checkpoint tracked on val loss -> "
           f"checkpoints/chat/chat_best.pt on {_HF_UPLOAD_REPO}")
     print(f"  Uploads serialized through one worker thread (no concurrent 4 GB transfers)\n")
     model.train()
@@ -456,7 +483,7 @@ def main():
             if losses["val"] < best_val_loss:
                 prev = best_val_loss
                 best_val_loss = losses["val"]
-                print(f"  ✓ New best val loss {best_val_loss:.4f} "
+                print(f"  * New best val loss {best_val_loss:.4f} "
                       f"(prev {prev:.4f}), saving chat_best.pt", flush=True)
                 save_and_upload_chat_checkpoint(
                     model, optimizer, step, cfg,

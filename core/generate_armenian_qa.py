@@ -186,7 +186,7 @@ def main():
                 print(f" ✗ Error: {e}")
                 errors += 1
                 if "rate_limit" in str(e).lower() or "overloaded" in str(e).lower():
-                    print("    Rate limit hit — waiting 30s...")
+                    print("    Rate limit hit - waiting 30s...")
                     time.sleep(30)
 
             if errors >= 5:

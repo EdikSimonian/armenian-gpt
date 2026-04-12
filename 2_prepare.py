@@ -139,7 +139,7 @@ def process_source(src_name: str, src_path: str, seen: set, fout,
     paragraphs to `fout`, separated by blank lines.
     """
     if not os.path.exists(src_path):
-        print(f"  [{src_name}] MISSING ({src_path}) — skipping")
+        print(f"  [{src_name}] MISSING ({src_path}) - skipping")
         stats[src_name] = {"status": "missing"}
         return
 
@@ -188,7 +188,7 @@ def process_source(src_name: str, src_path: str, seen: set, fout,
                if (kept_paras + drop_dupes) else 0.0)
     print(
         f"  [{src_name:17s}] "
-        f"{size_mb:>6.0f} MB in → {out_chars / 1024 / 1024:>6.0f} MB out  "
+        f"{size_mb:>6.0f} MB in -> {out_chars / 1024 / 1024:>6.0f} MB out  "
         f"(-{compression:>4.1f}%)  "
         f"kept {kept_paras:>8,}  "
         f"dupes {drop_dupes:>8,} ({dup_pct:>4.1f}%)  "
@@ -322,7 +322,7 @@ def prepare_qa() -> None:
 
     n = merge_sft_sources(input_paths, output_path)
     if n == 0:
-        print("merge returned 0 pairs — check source files for parseable JSON")
+        print("merge returned 0 pairs - check source files for parseable JSON")
         sys.exit(1)
 
     print(f"\n{'=' * 60}")

@@ -1151,7 +1151,7 @@ def download_corpus(args):
             hf_token = None
 
     print(f"{'='*60}")
-    print(f"  ArmGPT Corpus Download — Per-Source Files Mode")
+    print(f"  ArmGPT Corpus Download - Per-Source Files Mode")
     print(f"{'='*60}")
     print(f"  Output dir: {TEXT_TRAIN_DIR}")
     print(f"  HF cache:   {HF_CACHE_DIR}")
@@ -1342,7 +1342,7 @@ def download_corpus(args):
                             os.remove(partial)
                         except OSError:
                             pass
-                    print(f"  [{name}] Skipped — will be retried on next run.")
+                    print(f"  [{name}] Skipped - will be retried on next run.")
 
     # ---- Phase 3: Final cleanup ----
     print(f"\n{'='*40}")
@@ -2176,7 +2176,7 @@ def upload_dataset_to_hf(repo_id, corpus_path, finetune_dir, token=None,
 
     token = token or os.environ.get("HF_TOKEN") or get_token()
     if not token:
-        print("Error: no HF_TOKEN found — run 'hf auth login' first.")
+        print("Error: no HF_TOKEN found - run 'hf auth login' first.")
         sys.exit(1)
 
     api = HfApi(token=token)
@@ -2360,7 +2360,7 @@ def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None,
 
     token = token or os.environ.get("HF_TOKEN") or get_token()
     if not token:
-        print("Error: no HF_TOKEN found — run 'hf auth login' first.")
+        print("Error: no HF_TOKEN found - run 'hf auth login' first.")
         sys.exit(1)
 
     os.makedirs(train_dir, exist_ok=True)

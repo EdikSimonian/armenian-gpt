@@ -13,6 +13,13 @@ Usage:
 
 import argparse
 import os
+import sys
+
+# Force UTF-8 stdout/stderr on Windows so Armenian text can be printed
+if sys.platform == "win32":
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
 import torch
 
 from core.model import GPT
