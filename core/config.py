@@ -127,10 +127,10 @@ PRESETS = {
         block_size=2048,
         batch_size=8,
         grad_accum_steps=16, # effective batch = 8*16 = 128
-        max_iters=84000,     # ~22 B tokens seen, ~22 tok/param
-        learning_rate=2e-4,  # slightly lower than xxlarge for bigger model
+        max_iters=122000,    # 2 epochs over ~16 B unique tokens = ~32 B seen
+        learning_rate=2e-4,
         warmup_iters=2000,
-        eval_interval=2000,
+        eval_interval=4000,
         save_interval=2000,
         sample_interval=4000,
     ),
