@@ -2339,7 +2339,8 @@ def _lfs_orphan_cleanup(api, repo_id):
 
 
 def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None,
-                             tokenized=False, data_dir=None):
+                             tokenized=False, tokenized_only=False,
+                             data_dir=None):
     """Fetch the published corpus + Q&A bundle back into data/text/{train,finetune}/.
 
     This is the counterpart to ``--upload``: reconstructs the local
@@ -2349,7 +2350,12 @@ def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None,
     If ``tokenized=True``, also fetches pre-tokenized BPE bins from
     tokenized/ in the repo and decompresses them into data_dir, so
     you can skip 3_tokenize.py entirely.
+
+    If ``tokenized_only=True``, fetches ONLY the tokenized bins
+    (no corpus, no Q&A). Implies tokenized=True.
     """
+    if tokenized_only:
+        tokenized = True
     from huggingface_hub import HfApi, hf_hub_download, get_token
 
     token = token or os.environ.get("HF_TOKEN") or get_token()
@@ -2360,51 +2366,53 @@ def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None,
     os.makedirs(train_dir, exist_ok=True)
     os.makedirs(finetune_dir, exist_ok=True)
 
-    print(f"\n{'='*60}")
-    print(f"  Step 1/3: Fetching corpus from {repo_id}")
-    print(f"{'='*60}")
-    try:
-        zst_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=HF_CORPUS_PATH,
-            repo_type="dataset",
-            token=token,
-            cache_dir=HF_CACHE_DIR,
-        )
-    except Exception as e:
-        print(f"Error fetching {HF_CORPUS_PATH}: {e}")
-        print(f"Check that the repo exists and has been populated via --upload.")
-        sys.exit(1)
+    clean_out = None
+    if not tokenized_only:
+        print(f"\n{'='*60}")
+        print(f"  Step 1/3: Fetching corpus from {repo_id}")
+        print(f"{'='*60}")
+        try:
+            zst_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=HF_CORPUS_PATH,
+                repo_type="dataset",
+                token=token,
+                cache_dir=HF_CACHE_DIR,
+            )
+        except Exception as e:
+            print(f"Error fetching {HF_CORPUS_PATH}: {e}")
+            print(f"Check that the repo exists and has been populated via --upload.")
+            sys.exit(1)
 
-    print(f"  Downloaded: {zst_path}")
+        print(f"  Downloaded: {zst_path}")
 
-    print(f"\n{'='*60}")
-    print(f"  Step 2/3: Decompressing -> {train_dir}/clean_text.txt")
-    print(f"{'='*60}")
-    clean_out = os.path.join(train_dir, "clean_text.txt")
-    _decompress_zstd(zst_path, clean_out)
+        print(f"\n{'='*60}")
+        print(f"  Step 2/3: Decompressing -> {train_dir}/clean_text.txt")
+        print(f"{'='*60}")
+        clean_out = os.path.join(train_dir, "clean_text.txt")
+        _decompress_zstd(zst_path, clean_out)
 
-    # Fetch Q&A files
-    print(f"\n{'='*60}")
-    print(f"  Step 3/3: Fetching Q&A files")
-    print(f"{'='*60}")
-    api = HfApi(token=token)
-    all_files = api.list_repo_files(repo_id, repo_type="dataset", token=token)
-    qa_files = [
-        f for f in all_files
-        if f.startswith(f"{HF_FINETUNE_DIR}/") and f.endswith(".json")
-    ]
-    for hf_path in qa_files:
-        local_path = hf_hub_download(
-            repo_id=repo_id,
-            filename=hf_path,
-            repo_type="dataset",
-            token=token,
-            cache_dir=HF_CACHE_DIR,
-        )
-        target = os.path.join(finetune_dir, os.path.basename(hf_path))
-        shutil.copy2(local_path, target)
-        print(f"  {os.path.basename(hf_path)}")
+        # Fetch Q&A files
+        print(f"\n{'='*60}")
+        print(f"  Step 3/3: Fetching Q&A files")
+        print(f"{'='*60}")
+        api = HfApi(token=token)
+        all_files = api.list_repo_files(repo_id, repo_type="dataset", token=token)
+        qa_files = [
+            f for f in all_files
+            if f.startswith(f"{HF_FINETUNE_DIR}/") and f.endswith(".json")
+        ]
+        for hf_path in qa_files:
+            local_path = hf_hub_download(
+                repo_id=repo_id,
+                filename=hf_path,
+                repo_type="dataset",
+                token=token,
+                cache_dir=HF_CACHE_DIR,
+            )
+            target = os.path.join(finetune_dir, os.path.basename(hf_path))
+            shutil.copy2(local_path, target)
+            print(f"  {os.path.basename(hf_path)}")
 
     # Fetch pre-tokenized BPE bins if requested
     if tokenized and data_dir:
@@ -2442,14 +2450,16 @@ def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None,
 
     # Write a sentinel so reruns of 1_download.py know everything was
     # fetched from HF and nothing needs re-downloading from source.
-    with open(os.path.join(train_dir, ".downloaded_from_hf"), "w") as f:
-        f.write(f"{repo_id}\n")
+    if not tokenized_only:
+        with open(os.path.join(train_dir, ".downloaded_from_hf"), "w") as f:
+            f.write(f"{repo_id}\n")
 
     print(f"\n{'='*60}")
     print(f"  Done")
     print(f"{'='*60}")
-    print(f"  Corpus:   {clean_out}")
-    print(f"  Q&A dir:  {finetune_dir}")
+    if clean_out:
+        print(f"  Corpus:   {clean_out}")
+        print(f"  Q&A dir:  {finetune_dir}")
     if tokenized:
         print(f"  Tokenized: {data_dir}")
         print()
@@ -2486,6 +2496,9 @@ def main():
     parser.add_argument("--tokenized", action="store_true",
                         help="Include pre-tokenized BPE bins in --upload/--download "
                              "(train_bpe.bin, val_bpe.bin, tokenizer_bpe.json)")
+    parser.add_argument("--tokenized-only", action="store_true",
+                        help="With --download: fetch ONLY the tokenized BPE bins, "
+                             "skip corpus and Q&A")
     parser.add_argument("--hf-repo", type=str, default=DEFAULT_HF_DATASET_REPO,
                         help="Override the HF dataset repo for --upload/--download")
 
@@ -2502,12 +2515,13 @@ def main():
         )
         return
 
-    if args.download:
+    if args.download or args.tokenized_only:
         download_dataset_from_hf(
             repo_id=args.hf_repo,
             train_dir=TEXT_TRAIN_DIR,
             finetune_dir=TEXT_FINETUNE_DIR,
             tokenized=args.tokenized,
+            tokenized_only=args.tokenized_only,
             data_dir=DATA_DIR,
         )
         return
