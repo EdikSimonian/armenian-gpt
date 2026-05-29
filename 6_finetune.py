@@ -66,6 +66,7 @@ _upload_worker_started = False
 
 def _upload_worker_loop():
     from huggingface_hub import HfApi
+
     api = HfApi()
     while True:
         item = _upload_queue.get()
@@ -84,9 +85,15 @@ def _upload_worker_loop():
                     commit_message=commit_message,
                 )
                 dt = time.time() - t0
-                size_mb = os.path.getsize(local_path) / 1e6 if os.path.exists(local_path) else 0
-                print(f"  [hf-upload] OK  {repo_path}  ({size_mb:.0f} MB in {dt:.0f}s)",
-                      flush=True)
+                size_mb = (
+                    os.path.getsize(local_path) / 1e6
+                    if os.path.exists(local_path)
+                    else 0
+                )
+                print(
+                    f"  [hf-upload] OK  {repo_path}  ({size_mb:.0f} MB in {dt:.0f}s)",
+                    flush=True,
+                )
             except Exception as e:
                 print(f"  [hf-upload] FAIL {repo_path}: {e}", flush=True)
         finally:
@@ -113,8 +120,7 @@ def _hf_upload_bg(local_path, repo_path, commit_message):
     _upload_queue.put((local_path, repo_path, commit_message))
 
 
-def save_and_upload_chat_checkpoint(model, optimizer, step, cfg, local_name,
-                                    repo_name):
+def save_and_upload_chat_checkpoint(model, optimizer, step, cfg, local_name, repo_name):
     """Save a finetune checkpoint locally and queue its HF upload.
 
     Note: optimizer state is NOT included. SFT runs are short and restart-
@@ -129,11 +135,14 @@ def save_and_upload_chat_checkpoint(model, optimizer, step, cfg, local_name,
     global _HF_CHAT_TOKENIZER_UPLOADED
 
     local_path = os.path.join(cfg["checkpoint_dir"], local_name)
-    torch.save({
-        "model": model.state_dict(),
-        "step": step,
-        "config": cfg,
-    }, local_path)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "step": step,
+            "config": cfg,
+        },
+        local_path,
+    )
     size_gb = os.path.getsize(local_path) / 1e9
     print(f"  [checkpoint] saved {local_path} ({size_gb:.2f} GB)", flush=True)
 
@@ -143,6 +152,7 @@ def save_and_upload_chat_checkpoint(model, optimizer, step, cfg, local_name,
     # First upload also ships the chat tokenizer (once per run).
     if not _HF_CHAT_TOKENIZER_UPLOADED:
         from core import tokenizer_path as _tok_path
+
         chat_tok_path = _tok_path("data_chat", cfg["tokenizer"])
         if os.path.exists(chat_tok_path):
             _hf_upload_bg(
@@ -159,9 +169,22 @@ def save_and_upload_chat_checkpoint(model, optimizer, step, cfg, local_name,
     )
 
 
-def load_data(data_dir, tokenizer_type):
-    """Load the chat training and validation data for the given tokenizer."""
+def load_data(data_dir, tokenizer_type, allow_unmasked=False):
+    """Load the chat training/validation tokens and their loss masks.
+
+    Returns (train_data, val_data, train_mask, val_mask). The masks are uint8
+    arrays parallel to the token arrays (1 = response token to train on,
+    0 = prompt/markup token whose loss is ignored).
+
+    Missing masks are a HARD ERROR by default: training without them silently
+    flips the objective back to full next-token LM (the model learns to write
+    the *questions* too), which is easy to miss on a long run. Pass
+    allow_unmasked=True (CLI: --allow_unmasked) to fall back to all-token loss
+    deliberately. Mask lengths are validated against the token lengths so a
+    stale mask from an earlier data build can't silently mis-mask the objective.
+    """
     from core import bin_paths
+
     train_path, val_path = bin_paths(data_dir, tokenizer_type)
 
     if not os.path.exists(train_path):
@@ -171,38 +194,130 @@ def load_data(data_dir, tokenizer_type):
 
     train_data = np.memmap(train_path, dtype=np.uint16, mode="r")
     val_data = np.memmap(val_path, dtype=np.uint16, mode="r")
-    return train_data, val_data
+
+    train_mask_path = os.path.join(data_dir, f"train_mask_{tokenizer_type}.bin")
+    val_mask_path = os.path.join(data_dir, f"val_mask_{tokenizer_type}.bin")
+    have_masks = os.path.exists(train_mask_path) and os.path.exists(val_mask_path)
+
+    if not have_masks:
+        if not allow_unmasked:
+            print(
+                f"\nError: loss-mask bins not found in {data_dir}\n"
+                f"  expected: {train_mask_path}\n"
+                f"            {val_mask_path}\n"
+                "Re-run prepare_chat (3_tokenize.py --qa) to generate them, or pass\n"
+                "--allow_unmasked to train on ALL tokens (questions included) on purpose."
+            )
+            sys.exit(1)
+        print(
+            "  Loss masking: OFF (--allow_unmasked) — training on ALL tokens, "
+            "including the questions."
+        )
+        return train_data, val_data, None, None
+
+    train_mask = np.memmap(train_mask_path, dtype=np.uint8, mode="r")
+    val_mask = np.memmap(val_mask_path, dtype=np.uint8, mode="r")
+
+    # Guard against a stale mask left over from a previous, differently-sized
+    # data build — length mismatch would mis-align the objective or crash later.
+    if len(train_mask) != len(train_data) or len(val_mask) != len(val_data):
+        print(
+            f"\nError: loss-mask length mismatch (stale mask bins?)\n"
+            f"  train: tokens={len(train_data):,} mask={len(train_mask):,}\n"
+            f"  val:   tokens={len(val_data):,} mask={len(val_mask):,}\n"
+            "Re-run prepare_chat (3_tokenize.py --qa) to rebuild tokens + masks together."
+        )
+        sys.exit(1)
+
+    print("  Loss masking: ON (training on response tokens only)")
+    return train_data, val_data, train_mask, val_mask
 
 
 def load_tokenizer(data_dir, tokenizer_type):
     """Load the extended tokenizer with special chat tokens."""
     from core import load_tokenizer as _load, tokenizer_path
+
     tok_path = tokenizer_path(data_dir, tokenizer_type)
     if not os.path.exists(tok_path):
-        print(f"Error: {tok_path} not found! "
-              f"Run 3_tokenize.py --qa --tokenizer {tokenizer_type} first.")
+        print(
+            f"Error: {tok_path} not found! "
+            f"Run 3_tokenize.py --qa --tokenizer {tokenizer_type} first."
+        )
         sys.exit(1)
     return _load(data_dir, tokenizer_type)
 
 
-def get_batch(data, block_size, batch_size, device):
-    """Grab a random batch of sequences from the data."""
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy(data[i:i+block_size].astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy(data[i+1:i+1+block_size].astype(np.int64)) for i in ix])
-    return x.to(device), y.to(device)
+def get_batch(data, mask, block_size, batch_size, device):
+    """Grab a random batch of sequences from the data.
+
+    When `mask` is provided, target positions whose token is NOT a response
+    token are set to -100 so model()'s F.cross_entropy (ignore_index=-100)
+    skips them — i.e. loss is computed on assistant-response tokens only.
+    The mask slice is aligned to y (the targets), so it indexes [i+1:i+1+B].
+    """
+    # Retry guard: a batch whose targets are ALL -100 makes F.cross_entropy
+    # mean-reduce over zero elements -> NaN. (A single all-prompt sequence in
+    # the batch is fine; PyTorch averages over every non-ignored target across
+    # the whole batch.) We resample until at least one response token is
+    # present, and RAISE if we somehow can't — never return a NaN-producing
+    # batch silently.
+    max_tries = 32 if mask is not None else 1
+    for _ in range(max_tries):
+        ix = torch.randint(len(data) - block_size, (batch_size,))
+        x = torch.stack(
+            [torch.from_numpy(data[i : i + block_size].astype(np.int64)) for i in ix]
+        )
+        y = torch.stack(
+            [
+                torch.from_numpy(data[i + 1 : i + 1 + block_size].astype(np.int64))
+                for i in ix
+            ]
+        )
+        if mask is None:
+            return x.to(device), y.to(device)
+        m = torch.stack(
+            [
+                torch.from_numpy(mask[i + 1 : i + 1 + block_size].astype(np.bool_))
+                for i in ix
+            ]
+        )
+        y = y.masked_fill(~m, -100)
+        if (y != -100).any():
+            return x.to(device), y.to(device)  # >=1 response token — usable
+    raise RuntimeError(
+        f"get_batch: no response tokens in {max_tries} sampled batches "
+        f"(block_size={block_size}, batch_size={batch_size}). The mask may be "
+        f"all-zero or the response fraction is far too low — check prepare_chat output."
+    )
 
 
 @torch.no_grad()
-def estimate_loss(model, train_data, val_data, cfg):
-    """Estimate average loss on train and validation data."""
+def estimate_loss(
+    model,
+    train_data,
+    val_data,
+    train_mask,
+    val_mask,
+    cfg,
+    use_amp=False,
+    amp_dtype=None,
+):
+    """Estimate average (response-only, when masked) loss on train and val."""
     model.eval()
     results = {}
-    for split_name, data in [("train", train_data), ("val", val_data)]:
+    for split_name, data, mask in [
+        ("train", train_data, train_mask),
+        ("val", val_data, val_mask),
+    ]:
         losses = []
         for _ in range(cfg["eval_iters"]):
-            x, y = get_batch(data, cfg["block_size"], cfg["batch_size"], cfg["device"])
-            _, loss = model(x, y)
+            x, y = get_batch(
+                data, mask, cfg["block_size"], cfg["batch_size"], cfg["device"]
+            )
+            with torch.amp.autocast(
+                device_type="cuda", dtype=amp_dtype, enabled=use_amp
+            ):
+                _, loss = model(x, y)
             losses.append(loss.item())
         results[split_name] = sum(losses) / len(losses)
     model.train()
@@ -213,7 +328,9 @@ def get_lr(step, cfg):
     """Learning rate schedule: linear warmup then cosine decay."""
     if step < cfg["warmup_iters"]:
         return cfg["learning_rate"] * step / max(cfg["warmup_iters"], 1)
-    decay_ratio = (step - cfg["warmup_iters"]) / (cfg["max_iters"] - cfg["warmup_iters"])
+    decay_ratio = (step - cfg["warmup_iters"]) / (
+        cfg["max_iters"] - cfg["warmup_iters"]
+    )
     decay_ratio = min(decay_ratio, 1.0)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return cfg["min_lr"] + coeff * (cfg["learning_rate"] - cfg["min_lr"])
@@ -224,15 +341,25 @@ def main():
 
     # Parse --upload / --hf-repo before get_config() consumes the rest
     import argparse as _ap
+
     _pre = _ap.ArgumentParser(add_help=False)
-    _pre.add_argument("--upload", action="store_true",
-                      help="Upload checkpoints to HF during training")
-    _pre.add_argument("--hf-repo", type=str, default=None,
-                      help="HF model repo for uploads")
+    _pre.add_argument(
+        "--upload", action="store_true", help="Upload checkpoints to HF during training"
+    )
+    _pre.add_argument(
+        "--hf-repo", type=str, default=None, help="HF model repo for uploads"
+    )
+    _pre.add_argument(
+        "--allow_unmasked",
+        action="store_true",
+        help="Train on ALL tokens (questions included) if loss-mask bins are "
+        "absent, instead of erroring out. Off by default.",
+    )
     _pre_args, _remaining = _pre.parse_known_args()
     sys.argv = [sys.argv[0]] + _remaining
 
     _HF_UPLOAD_ENABLED = _pre_args.upload
+    allow_unmasked = _pre_args.allow_unmasked
     if _pre_args.hf_repo:
         _HF_UPLOAD_REPO = _pre_args.hf_repo
 
@@ -257,9 +384,9 @@ def main():
     # Stage 1 checkpoint path (only used in non-resume mode)
     stage1_ckpt = cfg.get("resume_from", "") or "checkpoints/final.pt"
 
-    print(f"\n{'='*50}")
-    print(f"  ArmGPT Stage 2: Fine-tuning for Chat")
-    print(f"{'='*50}")
+    print(f"\n{'=' * 50}")
+    print("  ArmGPT Stage 2: Fine-tuning for Chat")
+    print(f"{'=' * 50}")
     print(f"  Device:        {cfg['device']}")
     if resume_chat_from:
         print(f"  RESUMING from: {resume_chat_from}")
@@ -268,10 +395,12 @@ def main():
     print(f"  Chat data:     {chat_data_dir}/")
     print(f"  Max iters:     {cfg['max_iters']}")
     print(f"  Learning rate: {cfg['learning_rate']}")
-    print(f"{'='*50}\n")
+    print(f"{'=' * 50}\n")
 
     # Load chat data and tokenizer
-    train_data, val_data = load_data(chat_data_dir, cfg["tokenizer"])
+    train_data, val_data, train_mask, val_mask = load_data(
+        chat_data_dir, cfg["tokenizer"], allow_unmasked=allow_unmasked
+    )
     tokenizer = load_tokenizer(chat_data_dir, cfg["tokenizer"])
     print(f"Chat train data: {len(train_data):,} tokens")
     print(f"Chat val data:   {len(val_data):,} tokens")
@@ -300,16 +429,27 @@ def main():
         # RoPE buffer size (1024).
         vocab_size = int(state["transformer.wte.weight"].shape[0])
         n_embd = int(state["transformer.wte.weight"].shape[1])
-        n_layer = max(int(k.split(".")[2]) for k in state if k.startswith("transformer.blocks.")) + 1
+        n_layer = (
+            max(
+                int(k.split(".")[2])
+                for k in state
+                if k.startswith("transformer.blocks.")
+            )
+            + 1
+        )
         rope_cos = state["transformer.blocks.0.attn.rope_cos"]
         model_block_size = int(rope_cos.shape[0])
         head_dim = int(rope_cos.shape[1]) * 2  # RoPE uses half the head_dim
         n_head = n_embd // head_dim
-        print(f"  Inferred arch: vocab={vocab_size} n_layer={n_layer} n_head={n_head} "
-              f"n_embd={n_embd} model_block_size={model_block_size}")
+        print(
+            f"  Inferred arch: vocab={vocab_size} n_layer={n_layer} n_head={n_head} "
+            f"n_embd={n_embd} model_block_size={model_block_size}"
+        )
 
         if vocab_size != tokenizer.vocab_size:
-            print(f"  WARNING: tokenizer vocab {tokenizer.vocab_size} != ckpt vocab {vocab_size}")
+            print(
+                f"  WARNING: tokenizer vocab {tokenizer.vocab_size} != ckpt vocab {vocab_size}"
+            )
 
         model = GPT(
             vocab_size=vocab_size,
@@ -365,8 +505,12 @@ def main():
         stage1_state = checkpoint["model"]
         # Strip torch.compile() prefix if present.
         if any(k.startswith("_orig_mod.") for k in stage1_state):
-            stage1_state = {k.removeprefix("_orig_mod."): v for k, v in stage1_state.items()}
-            print("  Stripped _orig_mod. prefix from state dict (torch.compile checkpoint)")
+            stage1_state = {
+                k.removeprefix("_orig_mod."): v for k, v in stage1_state.items()
+            }
+            print(
+                "  Stripped _orig_mod. prefix from state dict (torch.compile checkpoint)"
+            )
         model_state = model.state_dict()
 
         for key in stage1_state:
@@ -376,9 +520,9 @@ def main():
                 if old_shape == new_shape:
                     model_state[key] = stage1_state[key]
                 elif len(old_shape) == 2 and old_shape[1] == new_shape[1]:
-                    model_state[key][:old_shape[0]] = stage1_state[key]
+                    model_state[key][: old_shape[0]] = stage1_state[key]
                 elif len(old_shape) == 1 and old_shape[0] < new_shape[0]:
-                    model_state[key][:old_shape[0]] = stage1_state[key]
+                    model_state[key][: old_shape[0]] = stage1_state[key]
 
         model.load_state_dict(model_state)
         print(f"  Loaded Stage 1 weights (vocab: {old_vocab_size} -> {new_vocab_size})")
@@ -399,12 +543,41 @@ def main():
         weight_decay=cfg["weight_decay"],
     )
 
+    # Mixed precision + gradient accumulation (mirrors 4_train.py). On CUDA we
+    # autocast to BF16 (Ampere+) or FP16 (older, with a GradScaler); on CPU/MPS
+    # AMP is off. grad_accum_steps lets a modest microbatch reach a less noisy
+    # effective batch without the extra VRAM.
+    grad_accum = cfg.get("grad_accum_steps", 1) or 1
+    use_amp = device == "cuda"
+    amp_dtype = torch.float16
+    if use_amp and torch.cuda.is_bf16_supported():
+        amp_dtype = torch.bfloat16
+    use_scaler = use_amp and amp_dtype == torch.float16
+    if device == "cuda":
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+    scaler = torch.amp.GradScaler(enabled=use_scaler)
+    print(
+        f"  Precision:   {str(amp_dtype).replace('torch.', '') if use_amp else 'fp32'}"
+        f"{' + GradScaler' if use_scaler else ''}"
+    )
+    print(
+        f"  Grad accum:  {grad_accum} (effective batch = "
+        f"{cfg['batch_size'] * grad_accum})"
+    )
+
     # Create checkpoint directory
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
 
     # Metrics tracking
-    metrics = {"steps": [], "train_loss": [], "val_loss": [],
-               "perplexity": [], "tokens_per_sec": []}
+    metrics = {
+        "steps": [],
+        "train_loss": [],
+        "val_loss": [],
+        "perplexity": [],
+        "tokens_per_sec": [],
+    }
 
     # How often to snapshot a chat checkpoint and kick off an HF upload.
     # Defaults to 1000 but honors cfg["save_interval"] if the preset/CLI set it.
@@ -416,54 +589,92 @@ def main():
     best_val_loss = float("inf")
 
     # Training loop
-    print(f"\nStarting fine-tuning...")
+    print("\nStarting fine-tuning...")
     if start_step > 0:
-        print(f"  RESUMING at step {start_step}, will run through step {cfg['max_iters']}")
-    print(f"  Periodic chat checkpoints every {chat_save_interval} steps -> "
-          f"checkpoints/chat/chat_step_NNNNN.pt on {_HF_UPLOAD_REPO}")
-    print(f"  Best checkpoint tracked on val loss -> "
-          f"checkpoints/chat/chat_best.pt on {_HF_UPLOAD_REPO}")
-    print(f"  Uploads serialized through one worker thread (no concurrent 4 GB transfers)\n")
+        print(
+            f"  RESUMING at step {start_step}, will run through step {cfg['max_iters']}"
+        )
+    print(
+        f"  Periodic chat checkpoints every {chat_save_interval} steps -> "
+        f"checkpoints/chat/chat_step_NNNNN.pt on {_HF_UPLOAD_REPO}"
+    )
+    print(
+        f"  Best checkpoint tracked on val loss -> "
+        f"checkpoints/chat/chat_best.pt on {_HF_UPLOAD_REPO}"
+    )
+    print(
+        "  Uploads serialized through one worker thread (no concurrent 4 GB transfers)\n"
+    )
     model.train()
     t0 = time.time()
 
+    tokens_per_step = cfg["batch_size"] * cfg["block_size"] * grad_accum
     for step in range(start_step, cfg["max_iters"]):
         # Update learning rate
         lr = get_lr(step, cfg)
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
-        # Forward + backward
-        x, y = get_batch(train_data, cfg["block_size"], cfg["batch_size"], device)
-        logits, loss = model(x, y)
+        # Forward + backward over grad_accum micro-batches before stepping.
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        loss_accum = 0.0
+        for _ in range(grad_accum):
+            x, y = get_batch(
+                train_data, train_mask, cfg["block_size"], cfg["batch_size"], device
+            )
+            with torch.amp.autocast(
+                device_type="cuda", dtype=amp_dtype, enabled=use_amp
+            ):
+                logits, loss = model(x, y)
+                loss = loss / grad_accum  # scale for accumulation
+            loss_accum += loss.item()
+            if use_scaler:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
         if cfg["grad_clip"] > 0:
+            if use_scaler:
+                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
 
-        optimizer.step()
+        if use_scaler:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
         # Print training loss
         if step % cfg["log_interval"] == 0:
             dt = time.time() - t0
-            tokens_per_sec = cfg["batch_size"] * cfg["block_size"] / dt if dt > 0 else 0
+            tokens_per_sec = tokens_per_step * cfg["log_interval"] / dt if dt > 0 else 0
             t0 = time.time()
-            print(f"step {step:5d} | loss {loss.item():.4f} | "
-                  f"lr {lr:.2e} | {tokens_per_sec:.0f} tok/s")
+            print(
+                f"step {step:5d} | loss {loss_accum:.4f} | "
+                f"lr {lr:.2e} | {tokens_per_sec:.0f} tok/s"
+            )
 
         # Evaluate
         if step > 0 and step % cfg["eval_interval"] == 0:
-            losses = estimate_loss(model, train_data, val_data, cfg)
+            losses = estimate_loss(
+                model,
+                train_data,
+                val_data,
+                train_mask,
+                val_mask,
+                cfg,
+                use_amp=use_amp,
+                amp_dtype=amp_dtype,
+            )
             perplexity = math.exp(losses["val"])
 
-            print(f"\n{'='*50}")
+            print(f"\n{'=' * 50}")
             print(f"  Step {step} Evaluation")
             print(f"  Train loss:   {losses['train']:.4f}")
             print(f"  Val loss:     {losses['val']:.4f}")
             print(f"  Perplexity:   {perplexity:.2f}")
             print(f"  Best val so far: {best_val_loss:.4f}")
-            print(f"{'='*50}")
+            print(f"{'=' * 50}")
 
             metrics["steps"].append(step)
             metrics["train_loss"].append(losses["train"])
@@ -483,25 +694,36 @@ def main():
             if losses["val"] < best_val_loss:
                 prev = best_val_loss
                 best_val_loss = losses["val"]
-                print(f"  * New best val loss {best_val_loss:.4f} "
-                      f"(prev {prev:.4f}), saving chat_best.pt", flush=True)
+                print(
+                    f"  * New best val loss {best_val_loss:.4f} "
+                    f"(prev {prev:.4f}), saving chat_best.pt",
+                    flush=True,
+                )
                 save_and_upload_chat_checkpoint(
-                    model, optimizer, step, cfg,
-                    local_name="chat_best.pt", repo_name="chat_best.pt",
+                    model,
+                    optimizer,
+                    step,
+                    cfg,
+                    local_name="chat_best.pt",
+                    repo_name="chat_best.pt",
                 )
 
             # Generate a sample response
             model.eval()
-            sample_prompt = f"<|user|>Ի՞նչ է Հայաստանը:<|end|><|assistant|>"
+            sample_prompt = "<|user|>Ի՞նչ է Հայաստանը:<|end|><|assistant|>"
             prompt_ids = tokenizer.encode(sample_prompt)
             if prompt_ids:
                 context = torch.tensor([prompt_ids], dtype=torch.long, device=device)
                 end_ids = tokenizer.encode("<|end|>")
                 end_token_id = end_ids[0] if end_ids else None
                 stop = {end_token_id} if end_token_id is not None else None
-                generated = model.generate(context, max_new_tokens=200,
-                                           temperature=0.7, top_k=40,
-                                           stop_tokens=stop)
+                generated = model.generate(
+                    context,
+                    max_new_tokens=200,
+                    temperature=0.7,
+                    top_k=40,
+                    stop_tokens=stop,
+                )
                 text = tokenizer.decode(generated[0].tolist())
                 # Clean up special tokens for display
                 text = text.replace("<|user|>", "\nUser: ")
@@ -517,41 +739,80 @@ def main():
         if step > 0 and step % chat_save_interval == 0:
             name = f"chat_step_{step:05d}.pt"
             save_and_upload_chat_checkpoint(
-                model, optimizer, step, cfg,
-                local_name=name, repo_name=name,
+                model,
+                optimizer,
+                step,
+                cfg,
+                local_name=name,
+                repo_name=name,
             )
+
+    # Final evaluation BEFORE saving, so the end-of-run model gets a fair shot
+    # at chat_best.pt. With a short run the LR anneals to its floor right at the
+    # end, so the final step is often the best — if we only updated best inside
+    # the loop (last eval at max_iters - (max_iters % eval_interval)) we'd ship
+    # a stale chat_best.pt.
+    losses = estimate_loss(
+        model,
+        train_data,
+        val_data,
+        train_mask,
+        val_mask,
+        cfg,
+        use_amp=use_amp,
+        amp_dtype=amp_dtype,
+    )
+    perplexity = math.exp(losses["val"])
+
+    if losses["val"] < best_val_loss:
+        prev = best_val_loss
+        best_val_loss = losses["val"]
+        print(
+            f"  * Final model is new best val {best_val_loss:.4f} "
+            f"(prev {prev:.4f}), saving chat_best.pt",
+            flush=True,
+        )
+        save_and_upload_chat_checkpoint(
+            model,
+            optimizer,
+            cfg["max_iters"],
+            cfg,
+            local_name="chat_best.pt",
+            repo_name="chat_best.pt",
+        )
 
     # Save final Stage 2 checkpoint and upload as chat_final.pt
     save_and_upload_chat_checkpoint(
-        model, optimizer, cfg["max_iters"], cfg,
-        local_name="chat_final.pt", repo_name="chat_final.pt",
+        model,
+        optimizer,
+        cfg["max_iters"],
+        cfg,
+        local_name="chat_final.pt",
+        repo_name="chat_final.pt",
     )
     final_path = os.path.join(cfg["checkpoint_dir"], "chat_final.pt")
 
-    # Final evaluation
-    losses = estimate_loss(model, train_data, val_data, cfg)
-    perplexity = math.exp(losses["val"])
-
-    print(f"\n{'='*50}")
-    print(f"  Fine-tuning Complete!")
-    print(f"{'='*50}")
+    print(f"\n{'=' * 50}")
+    print("  Fine-tuning Complete!")
+    print(f"{'=' * 50}")
     print(f"  Final train loss: {losses['train']:.4f}")
     print(f"  Final val loss:   {losses['val']:.4f}")
     print(f"  Final perplexity: {perplexity:.2f}")
+    print(f"  Best val loss:    {best_val_loss:.4f}")
     print(f"  Checkpoint saved: {final_path}")
 
     # Drain the upload queue before exiting so the final checkpoint actually
     # finishes its upload (otherwise the daemon worker thread dies with the
     # main process and the last checkpoint never lands on HF).
     if _upload_worker_started:
-        print(f"\n  Waiting for pending HF uploads to drain...", flush=True)
+        print("\n  Waiting for pending HF uploads to drain...", flush=True)
         _upload_queue.put(None)  # sentinel
         # Block until the worker has popped every queued item AND processed
         # the sentinel. timeout is generous: 4 GB at 30 MB/s ≈ 130s, ×N pending.
         _upload_queue.join()
-        print(f"  All uploads complete.", flush=True)
+        print("  All uploads complete.", flush=True)
 
-    print(f"\n  Chat with your model: python 8_chat.py")
+    print("\n  Chat with your model: python 8_chat.py")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,16 @@
+venv/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+.DS_Store
+data/
+data_chat/
+checkpoints/
+checkpoints_chat/
+*.bin
+*.bz2
+*.model
+*.vocab
+pipeline_log.txt
+core/hf-space/

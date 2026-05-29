@@ -79,9 +79,7 @@ IO_BUFFER = 16 * 1024 * 1024
 # Armenian block U+0530-U+058F covers the alphabet. U+FB13-U+FB17 are
 # ligatures that appear in older printing. We also keep ASCII punctuation,
 # digits, and whitespace so the tokenizer sees real sentences.
-_RE_NON_ARMENIAN = re.compile(
-    r"[^\u0530-\u058F\uFB13-\uFB17 \n\t.,;:!?\-()\"'0-9]"
-)
+_RE_NON_ARMENIAN = re.compile(r"[^\u0530-\u058F\uFB13-\uFB17 \n\t.,;:!?\-()\"'0-9]")
 _RE_SPACES = re.compile(r"[ \t]+")
 _RE_NEWLINES = re.compile(r"\n{3,}")
 _RE_PARAGRAPH_SPLIT = re.compile(r"\n\s*\n+")
@@ -131,8 +129,9 @@ def iter_paragraphs(fp, min_bytes=50):
                 yield p
 
 
-def process_source(src_name: str, src_path: str, seen: set, fout,
-                   dedup: bool, stats: dict) -> None:
+def process_source(
+    src_name: str, src_path: str, seen: set, fout, dedup: bool, stats: dict
+) -> None:
     """Clean + optionally dedup one source file, writing to the merged output.
 
     Updates `seen` (global hash set) and `stats` in place. Writes kept
@@ -184,8 +183,11 @@ def process_source(src_name: str, src_path: str, seen: set, fout,
         "elapsed_sec": round(elapsed, 1),
     }
 
-    dup_pct = (drop_dupes / (kept_paras + drop_dupes) * 100
-               if (kept_paras + drop_dupes) else 0.0)
+    dup_pct = (
+        drop_dupes / (kept_paras + drop_dupes) * 100
+        if (kept_paras + drop_dupes)
+        else 0.0
+    )
     print(
         f"  [{src_name:17s}] "
         f"{size_mb:>6.0f} MB in -> {out_chars / 1024 / 1024:>6.0f} MB out  "
@@ -201,8 +203,7 @@ def prepare_corpus(no_dedup: bool = False) -> None:
     """Clean + dedup + merge all 12 per-source corpus files."""
     # Resolve source paths and verify at least some exist before starting.
     sources = [
-        (name, os.path.join(TEXT_TRAIN_DIR, f"{name}_hy.txt"))
-        for name in SOURCE_ORDER
+        (name, os.path.join(TEXT_TRAIN_DIR, f"{name}_hy.txt")) for name in SOURCE_ORDER
     ]
     existing = [(n, p) for n, p in sources if os.path.exists(p)]
     missing = [n for n, p in sources if not os.path.exists(p)]
@@ -213,15 +214,17 @@ def prepare_corpus(no_dedup: bool = False) -> None:
         sys.exit(1)
 
     total_bytes = sum(os.path.getsize(p) for _, p in existing)
-    total_gb = total_bytes / (1024 ** 3)
+    total_gb = total_bytes / (1024**3)
 
     print(f"\n{'=' * 60}")
-    print(f"  Step 2: Clean + dedup + merge corpus")
+    print("  Step 2: Clean + dedup + merge corpus")
     print(f"{'=' * 60}")
     print(f"  Sources found:  {len(existing)}/{len(sources)}")
     print(f"  Sources missing: {missing if missing else '(none)'}")
     print(f"  Total input:    {total_gb:.2f} GB")
-    print(f"  Dedup:          {'ON (paragraph-level, blake2b-64)' if not no_dedup else 'OFF'}")
+    print(
+        f"  Dedup:          {'ON (paragraph-level, blake2b-64)' if not no_dedup else 'OFF'}"
+    )
     print(f"  Min paragraph:  {MIN_PARAGRAPH_CHARS} chars (after cleaning)")
     print(f"  Output:         {CLEAN_FILE}")
     print(f"{'=' * 60}\n")
@@ -233,15 +236,17 @@ def prepare_corpus(no_dedup: bool = False) -> None:
     with open(CLEAN_FILE, "w", encoding="utf-8", buffering=IO_BUFFER) as fout:
         for src_name, src_path in sources:
             process_source(
-                src_name, src_path,
+                src_name,
+                src_path,
                 seen if seen is not None else set(),
-                fout, dedup=not no_dedup,
+                fout,
+                dedup=not no_dedup,
                 stats=stats["sources"],
             )
 
     elapsed = time.time() - total_t0
     clean_size = os.path.getsize(CLEAN_FILE)
-    clean_gb = clean_size / (1024 ** 3)
+    clean_gb = clean_size / (1024**3)
 
     # Aggregate totals across sources.
     total_in = sum(s.get("chars_in", 0) for s in stats["sources"].values())
@@ -267,21 +272,26 @@ def prepare_corpus(no_dedup: bool = False) -> None:
         json.dump(stats, f, ensure_ascii=False, indent=2)
 
     print(f"\n{'=' * 60}")
-    print(f"  Step 2 complete")
+    print("  Step 2 complete")
     print(f"{'=' * 60}")
     print(f"  Input total:     {total_in / 1e9:>8.2f} G chars")
-    print(f"  Output total:    {total_out / 1e9:>8.2f} G chars  (-{global_compression:.1f}%)")
+    print(
+        f"  Output total:    {total_out / 1e9:>8.2f} G chars  (-{global_compression:.1f}%)"
+    )
     print(f"  Kept paragraphs: {total_kept:,}")
     if not no_dedup:
-        dedup_rate = (total_dupes / (total_kept + total_dupes) * 100
-                      if (total_kept + total_dupes) else 0.0)
+        dedup_rate = (
+            total_dupes / (total_kept + total_dupes) * 100
+            if (total_kept + total_dupes)
+            else 0.0
+        )
         print(f"  Dedup drops:     {total_dupes:,} ({dedup_rate:.1f}% of all seen)")
     print(f"  Short drops:     {total_short:,}")
     print(f"  Final file:      {clean_gb:.2f} GB ({clean_size:,} bytes)")
     print(f"  Wall time:       {elapsed:.0f}s ({elapsed / 60:.1f} min)")
     print(f"  Stats sidecar:   {STATS_FILE}")
     print()
-    print(f"Next step: python 3_tokenize.py --tokenizer bpe")
+    print("Next step: python 3_tokenize.py --tokenizer bpe")
 
 
 def prepare_qa() -> None:
@@ -293,11 +303,11 @@ def prepare_qa() -> None:
     # user ran the optional generators; they're listed first so their
     # native/curated pairs take priority over the larger translated sets.
     candidates = [
-        "armenian_qa.json",           # Claude-generated (optional)
-        "armenian_qa_qwen.json",      # Qwen long-form (optional)
+        "armenian_qa.json",  # Claude-generated (optional)
+        "armenian_qa_qwen.json",  # Qwen long-form (optional)
         "armenian_qa_qwen_short.json",  # Qwen short (optional)
-        "armbench_train.json",        # native exam QA
-        "aya_armenian.json",          # filtered Aya (mostly translated)
+        "armbench_train.json",  # native exam QA
+        "aya_armenian.json",  # filtered Aya (mostly translated)
     ]
     input_paths = [
         os.path.join(TEXT_FINETUNE_DIR, f)
@@ -306,8 +316,19 @@ def prepare_qa() -> None:
     ]
     output_path = os.path.join(TEXT_FINETUNE_DIR, "qa_merged.json")
 
+    # Rebalance the mix so the dataset isn't ~92% Aya rephrase/translate tasks.
+    # We CAP Aya rather than oversample the conversational QA: duplicating a
+    # ~2k-pair set replays identical gradient steps and invites memorization,
+    # whereas capping the dominant source fixes the ratio cleanly. After this,
+    # conversational QA (qwen + armbench) is ~35% of examples / ~45% of tokens.
+    # Adjust caps as the corpus grows (e.g. once #4 adds generated QA).
+    weights = {
+        "aya_armenian.json": {"cap": 5000},
+        # qwen / armbench / claude QA pass through at repeat 1 (no duplication).
+    }
+
     print(f"\n{'=' * 60}")
-    print(f"  Step 2: Merge SFT sources (--qa)")
+    print("  Step 2: Merge SFT sources (--qa)")
     print(f"{'=' * 60}")
     print(f"  Input files: {len(input_paths)}")
     for p in input_paths:
@@ -320,7 +341,7 @@ def prepare_qa() -> None:
         print("Run 'python 1_download.py --qa' first.")
         sys.exit(1)
 
-    n = merge_sft_sources(input_paths, output_path)
+    n = merge_sft_sources(input_paths, output_path, weights=weights)
     if n == 0:
         print("merge returned 0 pairs - check source files for parseable JSON")
         sys.exit(1)
@@ -333,13 +354,20 @@ def prepare_qa() -> None:
 
 def main() -> None:
     import argparse
+
     parser = argparse.ArgumentParser(
         description="Clean/dedup/merge corpus sources, or merge SFT Q&A JSONs"
     )
-    parser.add_argument("--qa", action="store_true",
-                        help="Merge SFT Q&A JSON files instead of corpus cleaning")
-    parser.add_argument("--no-dedup", action="store_true",
-                        help="Skip paragraph-level dedup (corpus mode only)")
+    parser.add_argument(
+        "--qa",
+        action="store_true",
+        help="Merge SFT Q&A JSON files instead of corpus cleaning",
+    )
+    parser.add_argument(
+        "--no-dedup",
+        action="store_true",
+        help="Skip paragraph-level dedup (corpus mode only)",
+    )
     args = parser.parse_args()
 
     if args.qa:

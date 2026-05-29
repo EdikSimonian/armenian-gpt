@@ -29,10 +29,14 @@ if sys.platform == "win32":
 os.environ["PYTHONUNBUFFERED"] = "1"
 
 import builtins
+
 _original_print = builtins.print
+
+
 def print(*args, **kwargs):
     kwargs.setdefault("flush", True)
     _original_print(*args, **kwargs)
+
 
 import time
 import json
@@ -47,6 +51,7 @@ from core.config import get_config
 def load_data(data_dir, tokenizer_type, device):
     """Load pre-encoded training and validation data for the given tokenizer."""
     from core import bin_paths
+
     train_path, val_path = bin_paths(data_dir, tokenizer_type)
 
     if not os.path.exists(train_path):
@@ -58,18 +63,25 @@ def load_data(data_dir, tokenizer_type, device):
     print("Loading data...")
     train_data = np.memmap(train_path, dtype=np.uint16, mode="r")
     val_data = np.memmap(val_path, dtype=np.uint16, mode="r")
-    print(f"  Train: {len(train_data):,} tokens ({os.path.getsize(train_path)/1024/1024:.0f} MB)")
-    print(f"  Val:   {len(val_data):,} tokens ({os.path.getsize(val_path)/1024/1024:.0f} MB)")
+    print(
+        f"  Train: {len(train_data):,} tokens ({os.path.getsize(train_path) / 1024 / 1024:.0f} MB)"
+    )
+    print(
+        f"  Val:   {len(val_data):,} tokens ({os.path.getsize(val_path) / 1024 / 1024:.0f} MB)"
+    )
     return train_data, val_data
 
 
 def load_tokenizer(data_dir, tokenizer_type):
     """Load the tokenizer that was used during data preparation."""
     from core import load_tokenizer as _load, tokenizer_path
+
     path = tokenizer_path(data_dir, tokenizer_type)
     if not os.path.exists(path):
-        print(f"Error: {path} not found! "
-              f"Run 3_tokenize.py --tokenizer {tokenizer_type} first.")
+        print(
+            f"Error: {path} not found! "
+            f"Run 3_tokenize.py --tokenizer {tokenizer_type} first."
+        )
         sys.exit(1)
     return _load(data_dir, tokenizer_type)
 
@@ -77,8 +89,66 @@ def load_tokenizer(data_dir, tokenizer_type):
 def get_batch(data, block_size, batch_size, device):
     """Grab a random batch of sequences from the data."""
     ix = torch.randint(len(data) - block_size - 1, (batch_size,))
-    x = torch.stack([torch.from_numpy(data[i:i+block_size].astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy(data[i+1:i+1+block_size].astype(np.int64)) for i in ix])
+    x = torch.stack(
+        [torch.from_numpy(data[i : i + block_size].astype(np.int64)) for i in ix]
+    )
+    y = torch.stack(
+        [
+            torch.from_numpy(data[i + 1 : i + 1 + block_size].astype(np.int64))
+            for i in ix
+        ]
+    )
+    return x.to(device), y.to(device)
+
+
+def make_train_sampler(n_tokens, block_size, seed, start_window):
+    """Block-aligned shuffle WITHOUT replacement, with a per-epoch phase shift.
+
+    Each epoch we (1) pick a deterministic phase in [0, block_size), then (2)
+    walk a fresh random permutation of n_blocks windows starting at
+    `phase + b*block_size`. The phase rotates the block grid every epoch, which:
+      - covers the whole corpus over epochs (the <block_size tail tokens that
+        fall off one epoch's grid are picked up by another phase), and
+      - shows every span at varied context offsets across epochs, restoring the
+        offset diversity the old random-offset get_batch had as free
+        augmentation — while still giving full block coverage each epoch.
+
+    Deterministic and seekable. n_blocks is held FIXED across epochs (sized for
+    the worst-case phase = block_size-1) so `divmod(start_window, n_blocks)` maps
+    a consumed-window count to (epoch, offset) exactly. `start_window` is the
+    number of windows already consumed (= step * batch_size * grad_accum). phase
+    and order are both drawn from a per-epoch Generator(seed+epoch) in a fixed
+    order, so any restart reconstructs them identically — required because the
+    thermal watchdog can bounce the container mid-run.
+    """
+    # Fixed for all epochs: for any phase in [0, block_size), the last window
+    # (start = phase + (n_blocks-1)*block_size) needs block_size+1 tokens, so
+    # (n_blocks+1)*block_size <= n_tokens must hold for the worst-case phase.
+    n_blocks = (n_tokens - block_size) // block_size
+    epoch, off = divmod(start_window, n_blocks)
+    while True:
+        g = torch.Generator().manual_seed(seed + epoch)
+        phase = int(torch.randint(0, block_size, (1,), generator=g).item())
+        order = torch.randperm(n_blocks, generator=g)
+        for b in order[off:].tolist():
+            yield phase + b * block_size
+        epoch += 1
+        off = 0
+
+
+def get_batch_seq(data, block_size, batch_size, device, sampler):
+    """Like get_batch, but pulls block-aligned offsets from a no-replacement
+    epoch sampler instead of sampling uniformly with replacement."""
+    ix = [next(sampler) for _ in range(batch_size)]
+    x = torch.stack(
+        [torch.from_numpy(data[i : i + block_size].astype(np.int64)) for i in ix]
+    )
+    y = torch.stack(
+        [
+            torch.from_numpy(data[i + 1 : i + 1 + block_size].astype(np.int64))
+            for i in ix
+        ]
+    )
     return x.to(device), y.to(device)
 
 
@@ -104,7 +174,9 @@ def get_lr(step, cfg):
     if step < cfg["warmup_iters"]:
         return cfg["learning_rate"] * step / max(cfg["warmup_iters"], 1)
     # Decay phase
-    decay_ratio = (step - cfg["warmup_iters"]) / (cfg["max_iters"] - cfg["warmup_iters"])
+    decay_ratio = (step - cfg["warmup_iters"]) / (
+        cfg["max_iters"] - cfg["warmup_iters"]
+    )
     decay_ratio = min(decay_ratio, 1.0)
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return cfg["min_lr"] + coeff * (cfg["learning_rate"] - cfg["min_lr"])
@@ -122,6 +194,13 @@ def main():
     device = cfg["device"]
     use_amp = device == "cuda"
 
+    # Pick autocast dtype: BF16 on Ampere+ (CC ≥ 8.0) for the wider range
+    # (no GradScaler needed), FP16 fallback for older GPUs.
+    amp_dtype = torch.float16
+    if use_amp and torch.cuda.is_bf16_supported():
+        amp_dtype = torch.bfloat16
+    use_scaler = use_amp and amp_dtype == torch.float16
+
     # Enable tf32 for Ampere+ GPUs (A6000, A100, RTX 30xx/40xx) — ~2x faster matmuls
     if device == "cuda":
         torch.set_float32_matmul_precision("high")
@@ -129,19 +208,28 @@ def main():
         torch.backends.cudnn.allow_tf32 = True
 
     # Print configuration
-    print(f"\n{'='*50}")
-    print(f"  ArmGPT Training")
-    print(f"{'='*50}")
+    print(f"\n{'=' * 50}")
+    print("  ArmGPT Training")
+    print(f"{'=' * 50}")
     print(f"  Device:      {device}")
-    print(f"  Model:       {cfg['n_layer']} layers, {cfg['n_head']} heads, {cfg['n_embd']} dim")
+    print(
+        f"  Model:       {cfg['n_layer']} layers, {cfg['n_head']} heads, {cfg['n_embd']} dim"
+    )
     print(f"  Block size:  {cfg['block_size']}")
     print(f"  Batch size:  {cfg['batch_size']}")
     print(f"  Max iters:   {cfg['max_iters']}")
     print(f"  Tokenizer:   {cfg['tokenizer']}")
-    print(f"  Grad accum:  {cfg.get('grad_accum_steps', 1)} (eff. batch = {cfg['batch_size'] * cfg.get('grad_accum_steps', 1)})")
+    print(
+        f"  Grad accum:  {cfg.get('grad_accum_steps', 1)} (eff. batch = {cfg['batch_size'] * cfg.get('grad_accum_steps', 1)})"
+    )
     print(f"  LR:          {cfg['learning_rate']}")
-    print(f"  AMP:         {'enabled' if use_amp else 'disabled'}")
-    print(f"{'='*50}\n")
+    amp_label = (
+        f"{str(amp_dtype).replace('torch.', '')}{' + GradScaler' if use_scaler else ''}"
+        if use_amp
+        else "disabled"
+    )
+    print(f"  AMP:         {amp_label}")
+    print(f"{'=' * 50}\n")
 
     # Load data and tokenizer
     train_data, val_data = load_data(cfg["data_dir"], cfg["tokenizer"], device)
@@ -165,23 +253,29 @@ def main():
             print("Compiling model with torch.compile()...")
             model = torch.compile(model)
         else:
-            print(f"Skipping torch.compile() (GPU compute capability {cc[0]}.{cc[1]} < 7.0)")
+            print(
+                f"Skipping torch.compile() (GPU compute capability {cc[0]}.{cc[1]} < 7.0)"
+            )
 
-    # Create optimizer
+    # Create optimizer. `fused=True` collapses param updates into a single
+    # CUDA kernel — ~2–4% step-time win at 1 B params, free on Ampere+.
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=cfg["learning_rate"],
         weight_decay=cfg["weight_decay"],
+        fused=(device == "cuda"),
     )
 
-    # Mixed precision scaler for faster training on GPU
-    scaler = torch.amp.GradScaler(enabled=use_amp)
+    # GradScaler is only active when autocast is FP16; for BF16 it's a no-op.
+    scaler = torch.amp.GradScaler(enabled=use_scaler)
 
     # Resume from checkpoint if specified
     start_iter = 0
     if cfg["resume_from"] and os.path.exists(cfg["resume_from"]):
         print(f"\nResuming from {cfg['resume_from']}...")
-        checkpoint = torch.load(cfg["resume_from"], map_location=device, weights_only=False)
+        checkpoint = torch.load(
+            cfg["resume_from"], map_location=device, weights_only=False
+        )
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
         start_iter = checkpoint["step"]
@@ -191,11 +285,18 @@ def main():
     os.makedirs(cfg["checkpoint_dir"], exist_ok=True)
 
     # Metrics tracking
-    metrics = {"steps": [], "train_loss": [], "val_loss": [],
-               "perplexity": [], "tokens_per_sec": [], "accuracy": []}
+    metrics = {
+        "steps": [],
+        "train_loss": [],
+        "val_loss": [],
+        "perplexity": [],
+        "tokens_per_sec": [],
+        "accuracy": [],
+    }
 
     # Graceful shutdown on SIGTERM/SIGINT — save checkpoint before exiting
     import signal
+
     _shutdown_requested = False
     _current_step = [0]
 
@@ -203,7 +304,9 @@ def main():
         nonlocal _shutdown_requested
         _shutdown_requested = True
         sig_name = signal.Signals(signum).name
-        print(f"\n{sig_name} received at step {_current_step[0]}. Saving checkpoint and exiting...")
+        print(
+            f"\n{sig_name} received at step {_current_step[0]}. Saving checkpoint and exiting..."
+        )
 
     signal.signal(signal.SIGTERM, _shutdown_handler)
     signal.signal(signal.SIGINT, _shutdown_handler)
@@ -211,7 +314,21 @@ def main():
     # Training loop
     grad_accum = cfg.get("grad_accum_steps", 1)
     tokens_per_step = cfg["batch_size"] * cfg["block_size"] * grad_accum
-    print(f"  Grad accum:  {grad_accum} steps (effective batch = {cfg['batch_size'] * grad_accum})")
+    print(
+        f"  Grad accum:  {grad_accum} steps (effective batch = {cfg['batch_size'] * grad_accum})"
+    )
+
+    # No-replacement epoch sampler for the training path: full block coverage
+    # per epoch with a per-epoch random phase shift (so the grid rotates and the
+    # corpus tail is covered over epochs). Seeded per epoch and seeked by the
+    # count of windows already consumed (start_iter * windows_per_step), so
+    # resumes land on the exact same schedule. Eval/accuracy keep random get_batch.
+    train_sampler = make_train_sampler(
+        len(train_data),
+        cfg["block_size"],
+        1337,
+        start_iter * cfg["batch_size"] * grad_accum,
+    )
     print(f"\nStarting training from step {start_iter}...\n")
     model.train()
     t0 = time.time()
@@ -225,16 +342,20 @@ def main():
         # Check for graceful shutdown
         if _shutdown_requested:
             ckpt_path = os.path.join(cfg["checkpoint_dir"], f"step_{step}.pt")
-            torch.save({
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "step": step,
-                "config": cfg,
-            }, ckpt_path)
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "step": step,
+                    "config": cfg,
+                },
+                ckpt_path,
+            )
             print(f"Emergency checkpoint saved: {ckpt_path}")
             if cfg.get("hf_repo"):
                 try:
                     from huggingface_hub import HfApi
+
                     HfApi().upload_file(
                         path_or_fileobj=ckpt_path,
                         path_in_repo=f"checkpoints/step_{step}.pt",
@@ -253,20 +374,31 @@ def main():
 
         # Gradient accumulation: run multiple micro-batches before updating
         for micro_step in range(grad_accum):
-            x, y = get_batch(train_data, cfg["block_size"], cfg["batch_size"], device)
-            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+            x, y = get_batch_seq(
+                train_data, cfg["block_size"], cfg["batch_size"], device, train_sampler
+            )
+            with torch.amp.autocast(
+                device_type="cuda", dtype=amp_dtype, enabled=use_amp
+            ):
                 logits, loss = model(x, y)
                 loss = loss / grad_accum  # scale loss by accumulation steps
             running_loss += loss.detach()
-            scaler.scale(loss).backward()
+            if use_scaler:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
 
         # Clip gradients to prevent explosions
         if cfg["grad_clip"] > 0:
-            scaler.unscale_(optimizer)
+            if use_scaler:
+                scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
 
-        scaler.step(optimizer)
-        scaler.update()
+        if use_scaler:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
         optimizer.zero_grad(set_to_none=True)
 
         # Print training loss (only sync GPU here, every log_interval steps)
@@ -286,9 +418,11 @@ def main():
             iters_left = cfg["max_iters"] - step
             eta = (elapsed / iters_done) * iters_left if iters_done > 0 else 0
 
-            print(f"step {step:5d}/{cfg['max_iters']} | loss {avg_loss:.4f} | "
-                  f"lr {lr:.2e} | {tps:,.0f} tok/s | "
-                  f"elapsed {fmt_time(elapsed)} | eta {fmt_time(eta)}")
+            print(
+                f"step {step:5d}/{cfg['max_iters']} | loss {avg_loss:.4f} | "
+                f"lr {lr:.2e} | {tps:,.0f} tok/s | "
+                f"elapsed {fmt_time(elapsed)} | eta {fmt_time(eta)}"
+            )
 
         # Evaluate and generate samples
         if step > 0 and step % cfg["eval_interval"] == 0:
@@ -296,20 +430,24 @@ def main():
             perplexity = math.exp(min(losses["val"], 20))  # cap to avoid overflow
 
             # Calculate accuracy on a validation batch
-            x_val, y_val = get_batch(val_data, cfg["block_size"], cfg["batch_size"], device)
+            x_val, y_val = get_batch(
+                val_data, cfg["block_size"], cfg["batch_size"], device
+            )
             with torch.no_grad():
-                with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+                with torch.amp.autocast(
+                    device_type="cuda", dtype=amp_dtype, enabled=use_amp
+                ):
                     val_logits, _ = model(x_val, y_val)
                 preds = val_logits.argmax(dim=-1)
                 accuracy = (preds == y_val).float().mean().item() * 100
 
-            print(f"\n{'='*50}")
+            print(f"\n{'=' * 50}")
             print(f"  Step {step} Evaluation")
             print(f"  Train loss:   {losses['train']:.4f}")
             print(f"  Val loss:     {losses['val']:.4f}")
             print(f"  Perplexity:   {perplexity:.2f}")
             print(f"  Accuracy:     {accuracy:.1f}%")
-            print(f"{'='*50}")
+            print(f"{'=' * 50}")
 
             # Log metrics
             metrics["steps"].append(step)
@@ -317,7 +455,7 @@ def main():
             metrics["val_loss"].append(losses["val"])
             metrics["perplexity"].append(perplexity)
             metrics["accuracy"].append(accuracy)
-            metrics["tokens_per_sec"].append(tps if 'tps' in dir() else 0)
+            metrics["tokens_per_sec"].append(tps if "tps" in dir() else 0)
 
             # Save metrics
             metrics_path = os.path.join(cfg["checkpoint_dir"], "metrics.json")
@@ -336,8 +474,9 @@ def main():
             if len(seed_ids) == 0:
                 seed_ids = [0]
             context = torch.tensor([seed_ids], dtype=torch.long, device=device)
-            generated = model.generate(context, max_new_tokens=cfg["sample_length"],
-                                       temperature=0.8, top_k=40)
+            generated = model.generate(
+                context, max_new_tokens=cfg["sample_length"], temperature=0.8, top_k=40
+            )
             text = tokenizer.decode(generated[0].tolist())
             print(f"\n--- Sample (step {step}) ---")
             sys.stdout.buffer.write(text.encode("utf-8", errors="replace"))
@@ -348,21 +487,34 @@ def main():
             t0 = time.time()
             running_loss = 0.0
 
-        # Save checkpoint and upload to HF
-        if step > 0 and step % cfg["save_interval"] == 0:
+        # Save checkpoint and upload to HF. After save_interval_late_start
+        # we switch to the finer save_interval_late cadence so we have dense
+        # snapshots of the late/asymptotic phase to pick the best from.
+        late_start = cfg.get("save_interval_late_start", float("inf"))
+        effective_save = (
+            cfg.get("save_interval_late", cfg["save_interval"])
+            if step >= late_start
+            else cfg["save_interval"]
+        )
+        if step > 0 and step % effective_save == 0:
             ckpt_path = os.path.join(cfg["checkpoint_dir"], f"step_{step}.pt")
-            torch.save({
-                "model": model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "step": step,
-                "config": cfg,
-            }, ckpt_path)
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "step": step,
+                    "config": cfg,
+                },
+                ckpt_path,
+            )
             print(f"Checkpoint saved: {ckpt_path}")
             # Upload checkpoint to HF in background with retries
             if cfg.get("hf_repo"):
                 import threading
+
                 def _upload_ckpt(path, repo, step_num, retries=3):
                     from huggingface_hub import HfApi
+
                     api = HfApi()
                     for attempt in range(retries):
                         try:
@@ -375,25 +527,60 @@ def main():
                             print(f"  Uploaded step_{step_num}.pt to HF")
                             return
                         except Exception as e:
-                            print(f"  HF upload attempt {attempt+1}/{retries} failed: {e}")
+                            print(
+                                f"  HF upload attempt {attempt + 1}/{retries} failed: {e}"
+                            )
                             if attempt < retries - 1:
-                                import time as _t; _t.sleep(30)
-                    print(f"  HF upload FAILED after {retries} attempts: step_{step_num}.pt")
-                threading.Thread(target=_upload_ckpt, args=(ckpt_path, cfg["hf_repo"], step), daemon=True).start()
+                                import time as _t
+
+                                _t.sleep(30)
+                    print(
+                        f"  HF upload FAILED after {retries} attempts: step_{step_num}.pt"
+                    )
+
+                threading.Thread(
+                    target=_upload_ckpt,
+                    args=(ckpt_path, cfg["hf_repo"], step),
+                    daemon=True,
+                ).start()
+
+            # Purge older local checkpoints to bound disk usage. With ~5 GB
+            # per checkpoint and save_interval=4000 over 122 k steps, that's
+            # ~150 GB if we kept them all — too much on a 500 GB root. HF
+            # still has the full history; the last 3 local are enough for
+            # any resume-from-disk scenario.
+            import re
+            import glob
+
+            KEEP_LOCAL = 5  # NAS sync runs out-of-band; 5 gives ~15 h cushion
+            ckpts = sorted(
+                glob.glob(os.path.join(cfg["checkpoint_dir"], "step_*.pt")),
+                key=lambda f: int(re.findall(r"step_(\d+)\.pt", f)[-1]),
+            )
+            for old in ckpts[:-KEEP_LOCAL]:
+                try:
+                    os.remove(old)
+                    print(f"  Purged old local checkpoint: {os.path.basename(old)}")
+                except OSError as e:
+                    print(f"  Failed to purge {old}: {e}")
 
     # Save final checkpoint
     final_path = os.path.join(cfg["checkpoint_dir"], "final.pt")
-    torch.save({
-        "model": model.state_dict(),
-        "optimizer": optimizer.state_dict(),
-        "step": cfg["max_iters"],
-        "config": cfg,
-    }, final_path)
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": cfg["max_iters"],
+            "config": cfg,
+        },
+        final_path,
+    )
 
     # Upload final checkpoint to HF
     if cfg.get("hf_repo"):
         try:
             from huggingface_hub import HfApi
+
             api = HfApi()
             api.upload_file(
                 path_or_fileobj=final_path,
@@ -410,9 +597,9 @@ def main():
     perplexity = math.exp(min(losses["val"], 20))
 
     elapsed = time.time() - train_start
-    print(f"\n{'='*50}")
-    print(f"  Training Complete!")
-    print(f"{'='*50}")
+    print(f"\n{'=' * 50}")
+    print("  Training Complete!")
+    print(f"{'=' * 50}")
     print(f"  Total time:       {fmt_time(elapsed)}")
     print(f"  Final train loss: {losses['train']:.4f}")
     print(f"  Final val loss:   {losses['val']:.4f}")
