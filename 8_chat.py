@@ -41,19 +41,45 @@ def load_tokenizer(data_dir, tokenizer_type=None):
 
 def main():
     parser = argparse.ArgumentParser(description="Chat with ArmGPT")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/chat_final.pt",
-                        help="Path to Stage 2 (chat) model checkpoint")
-    parser.add_argument("--temperature", type=float, default=0.7,
-                        help="Randomness: 0.3=focused, 0.7=balanced, 1.2=creative")
-    parser.add_argument("--top_k", type=int, default=40,
-                        help="Only sample from top k tokens (0=all)")
-    parser.add_argument("--max_length", type=int, default=300,
-                        help="Maximum response length in tokens")
-    parser.add_argument("--data_dir", type=str, default="data_chat",
-                        help="Directory containing the chat tokenizer file")
-    parser.add_argument("--tokenizer", type=str, default=None,
-                        choices=["char", "bpe"],
-                        help="Tokenizer type. If omitted, auto-detects from data_dir.")
+    parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default="checkpoints/chat_final.pt",
+        help="Path to Stage 2 (chat) model checkpoint",
+    )
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.7,
+        help="Randomness: 0.3=focused, 0.7=balanced, 1.2=creative",
+    )
+    parser.add_argument(
+        "--top_k", type=int, default=40, help="Only sample from top k tokens (0=all)"
+    )
+    parser.add_argument(
+        "--max_length", type=int, default=300, help="Maximum response length in tokens"
+    )
+    parser.add_argument(
+        "--repetition_penalty",
+        type=float,
+        default=1.15,
+        help="Penalize already-used tokens (>1 suppresses loops; 1.0=off). "
+        "Default 1.15 — the SFT set is small so the model is prone to repeat "
+        "loops on out-of-distribution prompts (e.g. how-to questions).",
+    )
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default="data_chat",
+        help="Directory containing the chat tokenizer file",
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        default=None,
+        choices=["char", "bpe"],
+        help="Tokenizer type. If omitted, auto-detects from data_dir.",
+    )
     args = parser.parse_args()
 
     # Load checkpoint
@@ -72,9 +98,27 @@ def main():
 
     # Infer model architecture from saved weights (config may be stale)
     state = checkpoint["model"]
+    # Strip torch.compile() prefix if present.
+    if any(k.startswith("_orig_mod.") for k in state):
+        state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
+        checkpoint["model"] = state
     cfg["n_embd"] = state["transformer.wte.weight"].shape[1]
-    cfg["n_layer"] = max(int(k.split(".")[2]) for k in state if k.startswith("transformer.blocks.")) + 1
-    if "transformer.blocks.0.attn.bias" in state:
+    cfg["n_layer"] = (
+        max(int(k.split(".")[2]) for k in state if k.startswith("transformer.blocks."))
+        + 1
+    )
+    # block_size: this model uses RoPE, so the rope_cos buffer's first dim IS the
+    # model's block_size. Do NOT trust cfg["block_size"] — for chat checkpoints it
+    # carries the *training-window* size (e.g. 1024), not the model's RoPE buffer
+    # size (e.g. 2048), which would size-mismatch on load. n_head likewise follows
+    # from the RoPE head_dim. Fall back to attn.bias for older non-RoPE ckpts.
+    rope_key = "transformer.blocks.0.attn.rope_cos"
+    if rope_key in state:
+        cfg["block_size"] = int(state[rope_key].shape[0])
+        head_dim = int(state[rope_key].shape[1]) * 2  # RoPE stores half the head_dim
+        if head_dim > 0 and cfg["n_embd"] % head_dim == 0:
+            cfg["n_head"] = cfg["n_embd"] // head_dim
+    elif "transformer.blocks.0.attn.bias" in state:
         cfg["block_size"] = state["transformer.blocks.0.attn.bias"].shape[-1]
 
     # Determine device
@@ -112,11 +156,11 @@ def main():
     top_k = args.top_k if args.top_k > 0 else None
 
     # Chat loop
-    print(f"\n{'='*50}")
-    print(f"  ArmGPT Chat")
+    print(f"\n{'=' * 50}")
+    print("  ArmGPT Chat")
     print(f"  Device: {device} | Temp: {args.temperature}")
-    print(f"  Type 'quit' to exit")
-    print(f"{'='*50}\n")
+    print("  Type 'quit' to exit")
+    print(f"{'=' * 50}\n")
 
     while True:
         try:
@@ -147,6 +191,7 @@ def main():
             temperature=args.temperature,
             top_k=top_k,
             stop_tokens=stop_tokens if stop_tokens else None,
+            repetition_penalty=args.repetition_penalty,
         )
 
         # Decode and clean up the response
@@ -156,7 +201,7 @@ def main():
         if "<|assistant|>" in full_text:
             response = full_text.split("<|assistant|>")[-1]
         else:
-            response = full_text[len(tokenizer.decode(prompt_ids)):]
+            response = full_text[len(tokenizer.decode(prompt_ids)) :]
 
         # Remove any trailing special tokens
         response = response.replace("<|end|>", "").replace("<|user|>", "").strip()
