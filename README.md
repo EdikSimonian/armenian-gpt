@@ -36,6 +36,91 @@ pip install torch
 pip install datasets requests mwxml anthropic
 ```
 
+### Environment notes
+
+**`error: externally-managed-environment` (Debian/Ubuntu, incl. most cloud/RunPod images).**
+Newer Debian-based Pythons (PEP 668) refuse a bare `pip install` into the system interpreter. Pick one:
+
+```bash
+# A) Disposable box (RunPod pod, throwaway container) — just override:
+pip install --break-system-packages numpy sentencepiece huggingface_hub zstandard
+
+# B) Reusable / your own machine — use a venv (recommended):
+python3 -m venv .venv
+source .venv/bin/activate            # then `pip install ...` normally
+# run everything (train.py, etc.) from this activated venv
+
+# C) If uv is available (auto-enforces a 48h package age-gate):
+uv pip install --system numpy sentencepiece huggingface_hub zstandard
+```
+
+On a disposable pod `--break-system-packages` is fine — the container is thrown away and there's no
+host Python to protect. On a machine you keep, always use the venv.
+
+**Windows.** PEP 668 does *not* apply (python.org installers aren't "externally managed"), so a bare
+`pip install` works without the override. Other differences:
+
+```powershell
+py -m venv .venv
+.venv\Scripts\Activate.ps1           # PowerShell  (or  .venv\Scripts\activate.bat  in cmd)
+pip install numpy sentencepiece huggingface_hub zstandard
+```
+
+- Use `py -m pip` / `py -m venv` rather than `python3`.
+- venv activation path is `.venv\Scripts\` (not `bin/`); use backslashes in paths.
+- Env vars: `setx HF_TOKEN ...` or `$env:HF_TOKEN="..."` in PowerShell, not `export`.
+- No MPS — CUDA (NVIDIA) or CPU only.
+- `torch.compile()` is flaky/unsupported on native Windows; the code already skips it when unavailable,
+  but if you hit Triton/Inductor errors, use WSL2 (below) — it's the recommended GPU path on Windows.
+
+#### Recommended on Windows: WSL2 (Ubuntu)
+
+Native Windows works for CPU/light runs, but for **GPU training** WSL2 is the path of least resistance —
+it's a real Linux kernel, so `torch.compile()`/Triton, `tmux`, and the Linux shell scripts
+(`upload_watcher.sh` etc.) all work exactly as documented, with near-native CUDA performance.
+
+**One-time setup (in Windows PowerShell, as Administrator):**
+
+```powershell
+wsl --install -d Ubuntu          # installs WSL2 + Ubuntu, then reboot if prompted
+# After reboot, Ubuntu opens and asks you to create a UNIX username/password.
+```
+
+You also need an up-to-date **NVIDIA Windows driver** (the GPU is shared from Windows — do **not**
+install a Linux GPU driver inside WSL). CUDA is exposed to WSL automatically; verify with `nvidia-smi`
+inside Ubuntu.
+
+**Inside the Ubuntu (WSL2) shell — from here everything is identical to the Linux instructions:**
+
+```bash
+# Keep the repo on the Linux filesystem (~/), NOT /mnt/c — see gotcha below.
+cd ~
+git clone https://github.com/EdikSimonian/armenian-gpt.git
+cd armenian-gpt
+
+sudo apt update && sudo apt install -y python3-venv python3-pip
+python3 -m venv .venv
+source .venv/bin/activate
+pip install numpy sentencepiece huggingface_hub zstandard
+pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+nvidia-smi                       # confirm the GPU is visible inside WSL
+python3 -c "import torch; print(torch.cuda.is_available())"   # -> True
+```
+
+Then follow the normal [Quick Start](#quick-start) / training steps unchanged.
+
+**WSL2 gotchas:**
+- **Keep the repo and data under the Linux home (`~/…`), not `/mnt/c/…`.** Cross-OS filesystem access
+  is extremely slow — tokenizing/reading the multi-GB `.bin` files from `/mnt/c` will bottleneck
+  training. Clone inside `~` and copy data there.
+- Access your WSL files from Windows Explorer via `\\wsl$\Ubuntu\home\<user>\…` if needed.
+- WSL2 can balloon RAM usage; cap it if needed via `%UserProfile%\.wslconfig`
+  (e.g. `[wsl2]` → `memory=24GB`).
+- GPU passthrough needs Windows 11 (or Win10 21H2+) and a recent NVIDIA driver. No extra CUDA toolkit
+  install is required just to run PyTorch — the pip CUDA wheel bundles what it needs.
+- Restart the distro after driver updates: `wsl --shutdown` in PowerShell, then reopen Ubuntu.
+
 ---
 
 ## Quick Start
