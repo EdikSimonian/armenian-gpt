@@ -147,6 +147,43 @@ PRESETS = {
         sample_interval=4000,
         dropout=0.0,  # 1 B params on 36 B tokens — no need for dropout
     ),
+    # v2 of the giant preset — same 930M architecture, modern recipe knobs.
+    # Pairs with the v2 data pipeline (32k vocab, document EOS, fixed cleaning).
+    # Differences from "giant":
+    #   - lr_schedule "wsd": warmup-stable-decay. The base run's horizon changed
+    #     twice (122k->125k, then stopped at 120k); WSD makes the model usable
+    #     throughout the stable phase and annealed only at the end, so stop/
+    #     extend/continue decisions are free. (cosine bakes the endpoint in.)
+    #   - qk_norm available via --qk_norm (kept OFF here so a default run doesn't
+    #     depend on every checkpoint-loader detecting it; flip on if you raise LR
+    #     or depth and see late-run spikes).
+    #   - weight-decay grouping + AdamW betas (0.9, 0.95) + scaled residual init
+    #     come from core/training.py and core/model.py automatically.
+    # NOTE: with the 32k vocab the corpus tokenizes to ~15-20% FEWER tokens, so
+    # recompute max_iters for the target epoch count from the printed token
+    # total after 3_tokenize (eff batch = 8*16*2048 = 262144 tokens/step).
+    "giant_v2": dict(
+        n_layer=32,
+        n_head=24,
+        n_embd=1536,
+        block_size=2048,
+        batch_size=8,
+        grad_accum_steps=16,  # effective batch = 8*16 = 128
+        max_iters=125000,  # recompute from the v2 token total (see NOTE)
+        learning_rate=2e-4,
+        min_lr=2e-5,  # 10% of peak
+        lr_schedule="wsd",
+        decay_frac=0.2,  # last 20% of steps anneal peak->min_lr
+        warmup_iters=2000,
+        qk_norm=False,
+        eval_interval=4000,
+        eval_iters=50,
+        save_interval=1000,
+        save_interval_late=1000,
+        save_interval_late_start=0,
+        sample_interval=4000,
+        dropout=0.0,
+    ),
     # Stage 2: fine-tuning on conversational data (small base model)
     "finetune": dict(
         n_layer=6,
@@ -229,8 +266,12 @@ max_iters = 5000  # total training steps
 learning_rate = 1e-3  # peak learning rate
 warmup_iters = 100  # linear warmup steps
 min_lr = 1e-4  # minimum learning rate after decay
-weight_decay = 0.1  # AdamW weight decay
+lr_schedule = "cosine"  # "cosine" or "wsd" (warmup-stable-decay)
+decay_frac = 0.2  # WSD only: fraction of steps spent annealing peak->min_lr
+weight_decay = 0.1  # AdamW weight decay (applied to dim>=2 params only)
 grad_clip = 1.0  # gradient clipping (0 = no clipping)
+qk_norm = False  # RMSNorm on per-head q/k (stabilizer; off by default)
+compile_mode = "default"  # torch.compile mode: default | max-autotune | reduce-overhead
 grad_accum_steps = (
     1  # gradient accumulation steps (effective batch = batch_size * this)
 )
@@ -271,6 +312,7 @@ def get_config():
             "xxlarge",
             "xxlarge_4epoch",
             "giant",
+            "giant_v2",
             "finetune",
             "finetune_giant",
         ],
@@ -292,6 +334,28 @@ def get_config():
         help="Floor for cosine LR decay (must be <= learning_rate)",
     )
     parser.add_argument("--grad_accum_steps", type=int, default=None)
+    parser.add_argument(
+        "--lr_schedule", type=str, default=None, choices=["cosine", "wsd"]
+    )
+    parser.add_argument(
+        "--decay_frac",
+        type=float,
+        default=None,
+        help="WSD only: fraction of steps spent annealing (e.g. 0.2)",
+    )
+    parser.add_argument(
+        "--qk_norm",
+        action="store_true",
+        default=None,
+        help="Enable per-head QK-normalization (attention-logit stabilizer)",
+    )
+    parser.add_argument(
+        "--compile_mode",
+        type=str,
+        default=None,
+        choices=["default", "max-autotune", "reduce-overhead"],
+        help="torch.compile mode",
+    )
     parser.add_argument("--tokenizer", type=str, default=None, choices=["char", "bpe"])
     parser.add_argument("--eval_interval", type=int, default=None)
     parser.add_argument("--save_interval", type=int, default=None)
@@ -324,6 +388,16 @@ def get_config():
     for key, val in vars(args).items():
         if val is not None and key != "preset":
             cfg[key] = val
+
+    # Guard: the cosine/WSD tail decays TOWARD min_lr, so min_lr must not exceed
+    # the peak — otherwise lowering --learning_rate below the default min_lr
+    # would make the schedule RAISE the LR in its tail. Clamp with a warning.
+    if cfg.get("min_lr") is not None and cfg["min_lr"] > cfg["learning_rate"]:
+        print(
+            f"  WARNING: min_lr ({cfg['min_lr']}) > learning_rate "
+            f"({cfg['learning_rate']}); clamping min_lr to the peak LR."
+        )
+        cfg["min_lr"] = cfg["learning_rate"]
 
     # Auto-detect device
     if cfg["device"] == "auto":

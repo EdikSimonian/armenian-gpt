@@ -46,6 +46,7 @@ import torch
 
 from core.model import GPT
 from core.config import get_config
+from core.training import configure_optimizer, get_lr, load_optimizer_state
 
 
 def load_data(data_dir, tokenizer_type, device):
@@ -86,6 +87,17 @@ def load_tokenizer(data_dir, tokenizer_type):
     return _load(data_dir, tokenizer_type)
 
 
+def _to_device(x, y, device):
+    """Move a batch to the device, overlapping the copy with compute on CUDA via
+    pinned memory + a non-blocking transfer."""
+    if device == "cuda":
+        return (
+            x.pin_memory().to(device, non_blocking=True),
+            y.pin_memory().to(device, non_blocking=True),
+        )
+    return x.to(device), y.to(device)
+
+
 def get_batch(data, block_size, batch_size, device):
     """Grab a random batch of sequences from the data."""
     ix = torch.randint(len(data) - block_size - 1, (batch_size,))
@@ -98,7 +110,7 @@ def get_batch(data, block_size, batch_size, device):
             for i in ix
         ]
     )
-    return x.to(device), y.to(device)
+    return _to_device(x, y, device)
 
 
 def make_train_sampler(n_tokens, block_size, seed, start_window):
@@ -149,37 +161,31 @@ def get_batch_seq(data, block_size, batch_size, device, sampler):
             for i in ix
         ]
     )
-    return x.to(device), y.to(device)
+    return _to_device(x, y, device)
 
 
 @torch.no_grad()
-def estimate_loss(model, train_data, val_data, cfg):
-    """Estimate average loss on train and validation data."""
+def estimate_loss(model, train_data, val_data, cfg, use_amp=False, amp_dtype=None):
+    """Estimate average loss on train and validation data.
+
+    Runs under the same autocast dtype as training (BF16/FP16 on CUDA) so eval
+    is 2-3x faster than the old fp32 path and measures loss in the regime the
+    model is actually trained in.
+    """
     model.eval()
     results = {}
     for split_name, data in [("train", train_data), ("val", val_data)]:
         losses = torch.zeros(cfg["eval_iters"])
         for k in range(cfg["eval_iters"]):
             x, y = get_batch(data, cfg["block_size"], cfg["batch_size"], cfg["device"])
-            _, loss = model(x, y)
+            with torch.amp.autocast(
+                device_type="cuda", dtype=amp_dtype, enabled=use_amp
+            ):
+                _, loss = model(x, y)
             losses[k] = loss.item()
         results[split_name] = losses.mean().item()
     model.train()
     return results
-
-
-def get_lr(step, cfg):
-    """Learning rate schedule: linear warmup then cosine decay."""
-    # Warmup phase
-    if step < cfg["warmup_iters"]:
-        return cfg["learning_rate"] * step / max(cfg["warmup_iters"], 1)
-    # Decay phase
-    decay_ratio = (step - cfg["warmup_iters"]) / (
-        cfg["max_iters"] - cfg["warmup_iters"]
-    )
-    decay_ratio = min(decay_ratio, 1.0)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return cfg["min_lr"] + coeff * (cfg["learning_rate"] - cfg["min_lr"])
 
 
 def fmt_time(seconds):
@@ -244,26 +250,25 @@ def main():
         n_embd=cfg["n_embd"],
         block_size=cfg["block_size"],
         dropout=cfg["dropout"],
+        qk_norm=cfg.get("qk_norm", False),
     ).to(device)
 
     # Compile model for faster training (PyTorch 2.0+, requires CC >= 7.0)
     if device == "cuda" and hasattr(torch, "compile"):
         cc = torch.cuda.get_device_capability()
         if cc[0] >= 7:
-            print("Compiling model with torch.compile()...")
-            model = torch.compile(model)
+            compile_mode = cfg.get("compile_mode", "default")
+            print(f"Compiling model with torch.compile(mode={compile_mode!r})...")
+            model = torch.compile(model, mode=compile_mode)
         else:
             print(
                 f"Skipping torch.compile() (GPU compute capability {cc[0]}.{cc[1]} < 7.0)"
             )
 
-    # Create optimizer. `fused=True` collapses param updates into a single
-    # CUDA kernel — ~2–4% step-time win at 1 B params, free on Ampere+.
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg["learning_rate"],
-        weight_decay=cfg["weight_decay"],
-        fused=(device == "cuda"),
+    # Optimizer with weight-decay grouping (decay dim>=2 only — never RMSNorm
+    # gains) and AdamW betas (0.9, 0.95). fused=True on CUDA.
+    optimizer = configure_optimizer(
+        model, cfg["weight_decay"], cfg["learning_rate"], device=device
     )
 
     # GradScaler is only active when autocast is FP16; for BF16 it's a no-op.
@@ -277,7 +282,11 @@ def main():
             cfg["resume_from"], map_location=device, weights_only=False
         )
         model.load_state_dict(checkpoint["model"])
-        optimizer.load_state_dict(checkpoint["optimizer"])
+        # Tolerate a pre-v2 single-group optimizer state (vs the new 2-group
+        # decay/no-decay split) — falls back to a fresh optimizer with a warning.
+        load_optimizer_state(
+            optimizer, checkpoint["optimizer"], where=cfg["resume_from"]
+        )
         start_iter = checkpoint["step"]
         print(f"Resumed at step {start_iter}")
 
@@ -388,11 +397,17 @@ def main():
             else:
                 loss.backward()
 
-        # Clip gradients to prevent explosions
+        # Clip gradients to prevent explosions. Keep the pre-clip norm: a
+        # sustained rise (or a sudden spike) is the earliest warning of
+        # divergence, well before it shows in the smoothed loss.
         if cfg["grad_clip"] > 0:
             if use_scaler:
                 scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(), cfg["grad_clip"]
+            ).item()
+        else:
+            grad_norm = float("nan")
 
         if use_scaler:
             scaler.step(optimizer)
@@ -420,13 +435,15 @@ def main():
 
             print(
                 f"step {step:5d}/{cfg['max_iters']} | loss {avg_loss:.4f} | "
-                f"lr {lr:.2e} | {tps:,.0f} tok/s | "
+                f"lr {lr:.2e} | gnorm {grad_norm:.2f} | {tps:,.0f} tok/s | "
                 f"elapsed {fmt_time(elapsed)} | eta {fmt_time(eta)}"
             )
 
         # Evaluate and generate samples
         if step > 0 and step % cfg["eval_interval"] == 0:
-            losses = estimate_loss(model, train_data, val_data, cfg)
+            losses = estimate_loss(
+                model, train_data, val_data, cfg, use_amp=use_amp, amp_dtype=amp_dtype
+            )
             perplexity = math.exp(min(losses["val"], 20))  # cap to avoid overflow
 
             # Calculate accuracy on a validation batch
@@ -469,7 +486,7 @@ def main():
         # Generate sample text
         if step > 0 and step % cfg["sample_interval"] == 0:
             model.eval()
-            seed_text = "Հayastan"
+            seed_text = "Հայաստան"  # all-Armenian (was "Հayastan" — mixed scripts)
             seed_ids = tokenizer.encode(seed_text)
             if len(seed_ids) == 0:
                 seed_ids = [0]
@@ -593,7 +610,9 @@ def main():
             print(f"  HF upload failed: {e}")
 
     # Final evaluation
-    losses = estimate_loss(model, train_data, val_data, cfg)
+    losses = estimate_loss(
+        model, train_data, val_data, cfg, use_amp=use_amp, amp_dtype=amp_dtype
+    )
     perplexity = math.exp(min(losses["val"], 20))
 
     elapsed = time.time() - train_start

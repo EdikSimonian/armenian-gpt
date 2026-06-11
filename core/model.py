@@ -56,7 +56,7 @@ def apply_rope(x, cos, sin, pos_offset=0):
 class CausalSelfAttention(nn.Module):
     """Self-attention with RoPE (no causal mask buffer needed — using F.scaled_dot_product_attention)."""
 
-    def __init__(self, n_embd, n_head, block_size, dropout):
+    def __init__(self, n_embd, n_head, block_size, dropout, qk_norm=False):
         super().__init__()
         assert n_embd % n_head == 0
         self.c_attn = nn.Linear(n_embd, 3 * n_embd, bias=False)
@@ -65,6 +65,14 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = n_embd
         self.head_dim = n_embd // n_head
         self.dropout = dropout
+        # Optional QK-normalization: RMSNorm on per-head queries and keys before
+        # RoPE. Cheap stabilizer (Gemma-2 / Qwen-2 style) that bounds attention
+        # logits — lets you push LR / depth without late-run loss spikes. Off by
+        # default so existing checkpoints are bit-for-bit unaffected.
+        self.qk_norm = qk_norm
+        if qk_norm:
+            self.q_norm = RMSNorm(self.head_dim)
+            self.k_norm = RMSNorm(self.head_dim)
         # Precompute RoPE
         cos, sin = precompute_rope(self.head_dim, block_size)
         self.register_buffer("rope_cos", cos)
@@ -78,6 +86,11 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         k = k.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
         v = v.view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+
+        # QK-norm (if enabled) before RoPE, so cached keys are already normed.
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         # Apply RoPE at the correct absolute positions (pos_offset..pos_offset+T)
         q = apply_rope(q, self.rope_cos, self.rope_sin, pos_offset)
@@ -126,10 +139,10 @@ class SwiGLUMLP(nn.Module):
 class Block(nn.Module):
     """Transformer block: RMSNorm + Attention + SwiGLU MLP."""
 
-    def __init__(self, n_embd, n_head, block_size, dropout):
+    def __init__(self, n_embd, n_head, block_size, dropout, qk_norm=False):
         super().__init__()
         self.ln_1 = RMSNorm(n_embd)
-        self.attn = CausalSelfAttention(n_embd, n_head, block_size, dropout)
+        self.attn = CausalSelfAttention(n_embd, n_head, block_size, dropout, qk_norm)
         self.ln_2 = RMSNorm(n_embd)
         self.mlp = SwiGLUMLP(n_embd, dropout)
 
@@ -143,16 +156,22 @@ class Block(nn.Module):
 class GPT(nn.Module):
     """GPT language model with RMSNorm, RoPE, and SwiGLU."""
 
-    def __init__(self, vocab_size, n_layer, n_head, n_embd, block_size, dropout):
+    def __init__(
+        self, vocab_size, n_layer, n_head, n_embd, block_size, dropout, qk_norm=False
+    ):
         super().__init__()
         self.block_size = block_size
+        self.n_layer = n_layer
 
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(vocab_size, n_embd),
                 drop=nn.Dropout(dropout),
                 blocks=nn.ModuleList(
-                    [Block(n_embd, n_head, block_size, dropout) for _ in range(n_layer)]
+                    [
+                        Block(n_embd, n_head, block_size, dropout, qk_norm)
+                        for _ in range(n_layer)
+                    ]
                 ),
                 ln_f=RMSNorm(n_embd),
             )
@@ -161,6 +180,15 @@ class GPT(nn.Module):
         self.transformer.wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
+        # GPT-2 / nanoGPT scaled init: shrink the residual-OUTPUT projections by
+        # 1/sqrt(2*n_layer) so the variance added back to the residual stream
+        # stays ~constant as depth grows. Without this, a 32-layer stack starts
+        # with an inflated residual norm and optimizes worse early on. Applied
+        # after the generic init, which doesn't know each module's depth role.
+        scale = (2 * n_layer) ** -0.5
+        for name, p in self.named_parameters():
+            if name.endswith("c_proj.weight") or name.endswith("w2.weight"):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02 * scale)
         n_params = sum(p.numel() for p in self.parameters())
         print(f"GPT model initialized: {n_params:,} parameters")
 
@@ -207,6 +235,8 @@ class GPT(nn.Module):
         max_new_tokens,
         temperature=1.0,
         top_k=None,
+        top_p=None,
+        min_p=None,
         stop_tokens=None,
         repetition_penalty=1.0,
     ):
@@ -217,10 +247,20 @@ class GPT(nn.Module):
         cache, so decoding is O(T) per token instead of re-running the full
         forward (O(T^2) overall). Output is identical to the un-cached loop.
 
+        Truncation filters compose in this order: top_k -> top_p -> min_p.
+        Leave them all None for pure temperature sampling.
+
         Args:
-            repetition_penalty: 1.0 = no penalty (off). >1.0 discourages
-                repeating tokens already in the context (CTRL-style penalty).
-                Typical values: 1.1–1.3. Helps small LMs escape repetition loops.
+            top_k: keep only the k highest-probability tokens.
+            top_p: nucleus sampling — keep the smallest set of tokens whose
+                cumulative probability reaches p (e.g. 0.9). Adapts the candidate
+                count to the distribution's sharpness, unlike a fixed top_k.
+            min_p: keep tokens with probability >= min_p * p_max (e.g. 0.05).
+                Cheap, robust truncation that tends to beat top_k/top_p for small
+                models — scales the floor with the model's own confidence.
+            repetition_penalty: 1.0 = off. >1.0 discourages repeating tokens
+                already in the context (CTRL-style). Typical 1.1–1.3; helps small
+                LMs escape repetition loops. Applied before temperature.
 
         Note: batch size 1 is assumed when stop_tokens/repetition_penalty are
         used. Generation stops once the cache spans block_size positions (no
@@ -254,6 +294,10 @@ class GPT(nn.Module):
             if top_k is not None:
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = float("-inf")
+            if top_p is not None:
+                logits = self._apply_top_p(logits, top_p)
+            if min_p is not None:
+                logits = self._apply_min_p(logits, min_p)
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
             idx = torch.cat((idx, idx_next), dim=1)
@@ -264,3 +308,23 @@ class GPT(nn.Module):
             if kvs[0][0].size(2) >= self.block_size:
                 break
         return idx
+
+    @staticmethod
+    def _apply_top_p(logits, top_p):
+        """Mask out the long tail beyond cumulative-probability `top_p`."""
+        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+        cumprobs = F.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+        # Remove tokens once cumulative prob has already exceeded top_p, but
+        # always keep the single most-probable token (shift the mask right).
+        remove = cumprobs > top_p
+        remove[..., 1:] = remove[..., :-1].clone()
+        remove[..., 0] = False
+        remove_scattered = remove.scatter(-1, sorted_idx, remove)
+        return logits.masked_fill(remove_scattered, float("-inf"))
+
+    @staticmethod
+    def _apply_min_p(logits, min_p):
+        """Keep tokens whose prob >= min_p * max_prob; mask the rest."""
+        probs = F.softmax(logits, dim=-1)
+        thresh = min_p * probs.amax(dim=-1, keepdim=True)
+        return logits.masked_fill(probs < thresh, float("-inf"))
