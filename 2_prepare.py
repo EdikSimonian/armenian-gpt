@@ -299,10 +299,12 @@ def prepare_qa() -> None:
     from core.merge_sft_sources import merge_sft_sources
 
     # Inputs in priority order — earlier sources win dedup ties.
-    # armenian_qa.json and armenian_qa_qwen*.json are only present if the
+    # armenian_qa_seed.json (the categorized 10k seed generator output),
+    # armenian_qa.json, and armenian_qa_qwen*.json are only present if the
     # user ran the optional generators; they're listed first so their
     # native/curated pairs take priority over the larger translated sets.
     candidates = [
+        "armenian_qa_seed.json",  # categorized seed generator (10k, highest quality)
         "armenian_qa.json",  # Claude-generated (optional)
         "armenian_qa_qwen.json",  # Qwen long-form (optional)
         "armenian_qa_qwen_short.json",  # Qwen short (optional)
