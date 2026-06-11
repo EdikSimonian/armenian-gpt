@@ -51,6 +51,23 @@ HF_CACHE_DIR = os.path.join(DATA_DIR, "hf")
 for _d in (DATA_DIR, TEXT_DIR, TEXT_TRAIN_DIR, TEXT_FINETUNE_DIR, HF_CACHE_DIR):
     os.makedirs(_d, exist_ok=True)
 
+# Document separator emitted after every document. 2_prepare.py preserves these
+# marker lines through cleaning/dedup, and 3_tokenize.py replaces each with the
+# tokenizer's EOS id — giving the model a document boundary (a stop signal) and
+# preventing unrelated documents from bleeding across attention inside a window.
+# Must equal core.DOC_SEPARATOR; kept as a literal here so this module needs no
+# import before the HF-cache env redirect above takes effect.
+DOC_SEPARATOR = "<|enddoc|>"
+_DOC_SUFFIX = "\n\n" + DOC_SEPARATOR + "\n\n"
+_DOC_SUFFIX_BYTES = _DOC_SUFFIX.encode("utf-8")
+
+
+def _write_doc(out, text):
+    """Write one document (str) followed by the document-separator block."""
+    out.write(text)
+    out.write(_DOC_SUFFIX)
+
+
 # Force-pin the HF cache to <project>/data/hf/ regardless of any inherited
 # HF_HOME / HF_DATASETS_CACHE / HF_HUB_CACHE from the user's shell. Using
 # direct assignment (not setdefault) so downloads never leak into
@@ -85,8 +102,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 DUMP_FILE = os.path.join(TEXT_TRAIN_DIR, "hywiki-latest-pages-articles.xml.bz2")
 WIKI_DUMP_URL = (
-    "https://dumps.wikimedia.org/hywiki/latest/"
-    "hywiki-latest-pages-articles.xml.bz2"
+    "https://dumps.wikimedia.org/hywiki/latest/hywiki-latest-pages-articles.xml.bz2"
 )
 
 # I/O buffer size — large buffers = fewer syscalls = faster merging
@@ -100,7 +116,7 @@ def clear_hf_cache():
             os.path.getsize(os.path.join(dp, f))
             for dp, _, fnames in os.walk(HF_CACHE_DIR)
             for f in fnames
-        ) / (1024 ** 3)
+        ) / (1024**3)
         print(f"  Clearing HF cache at {HF_CACHE_DIR} ({size:.1f} GB)...")
         shutil.rmtree(HF_CACHE_DIR, ignore_errors=True)
         os.makedirs(HF_CACHE_DIR, exist_ok=True)
@@ -165,8 +181,7 @@ def _commit_source(name, src_path):
         raise RuntimeError(f"[{name}] source file missing: {src_path}")
     size_mb = os.path.getsize(src_path) / (1024 * 1024)
     _write_marker(name)
-    print(f"  [{name}] Done ({size_mb:.0f} MB) -> kept as "
-          f"{os.path.basename(src_path)}")
+    print(f"  [{name}] Done ({size_mb:.0f} MB) -> kept as {os.path.basename(src_path)}")
 
 
 # =============================================================================
@@ -176,6 +191,7 @@ def _commit_source(name, src_path):
 # -----------------------------------------------------------------------------
 # Wikipedia
 # -----------------------------------------------------------------------------
+
 
 def _download_wikimedia_dump(url, dest_path, label, est_size_mb):
     """Generic Wikimedia XML dump downloader.
@@ -207,8 +223,7 @@ def _download_wikimedia_dump(url, dest_path, label, est_size_mb):
 
 def _download_wiki_dump():
     """Download the Armenian Wikipedia dump."""
-    _download_wikimedia_dump(WIKI_DUMP_URL, DUMP_FILE,
-                             "Armenian Wikipedia", 500)
+    _download_wikimedia_dump(WIKI_DUMP_URL, DUMP_FILE, "Armenian Wikipedia", 500)
 
 
 def _strip_wiki_markup(text):
@@ -217,7 +232,9 @@ def _strip_wiki_markup(text):
     text = re.sub(r"\{\{[^}]*\}\}", "", text)
     text = re.sub(r"\[\[(?:[^|\]]*\|)?([^\]]*)\]\]", r"\1", text)
     text = re.sub(r"\[https?://\S+\s*([^\]]*)\]", r"\1", text)
-    text = re.sub(r"\[\[(?:Категория|Category|Պատկdelays|File|Файл|Image):[^\]]*\]\]", "", text)
+    text = re.sub(
+        r"\[\[(?:Категория|Category|Պատկdelays|File|Файл|Image):[^\]]*\]\]", "", text
+    )
     text = re.sub(r"'{2,}", "", text)
     text = re.sub(r"={2,}(.+?)={2,}", r"\1", text)
     text = re.sub(r"<ref[^>]*>.*?</ref>", "", text, flags=re.DOTALL)
@@ -269,7 +286,7 @@ def _extract_wiki_articles(dump_path):
             if event != "end":
                 continue
 
-            tag = elem.tag[len(ns_prefix):] if ns_prefix else elem.tag
+            tag = elem.tag[len(ns_prefix) :] if ns_prefix else elem.tag
             if tag != "page":
                 continue
 
@@ -314,10 +331,12 @@ def _extract_wiki_articles(dump_path):
                 skipped["too_short"] += 1
 
     print(f"  Total articles extracted: {article_count}")
-    print(f"  Skipped: ns={skipped['ns']:,}  "
-          f"redirect={skipped['redirect']:,}  "
-          f"too_short={skipped['too_short']:,}  "
-          f"empty={skipped['empty']:,}")
+    print(
+        f"  Skipped: ns={skipped['ns']:,}  "
+        f"redirect={skipped['redirect']:,}  "
+        f"too_short={skipped['too_short']:,}  "
+        f"empty={skipped['empty']:,}"
+    )
 
 
 def download_wikipedia():
@@ -337,8 +356,7 @@ def download_wikipedia():
     chars = 0
     with open(out_file, "w", encoding="utf-8", buffering=IO_BUFFER) as out:
         for article_text in _extract_wiki_articles(DUMP_FILE):
-            out.write(article_text)
-            out.write("\n\n")
+            _write_doc(out, article_text)
             chars += len(article_text)
 
     print(f"  Wikipedia: {chars:,} chars ({chars / 1024 / 1024:.0f} MB)")
@@ -352,6 +370,7 @@ def download_wikipedia():
 # markup-strip pass. The only thing that varies is the project prefix on
 # the dumps URL and the local filenames. Each project gets its own
 # intermediate + marker so it can be skipped/retried independently.
+
 
 def _download_wikimedia_project(project, label, est_size_mb, out_filename):
     """Generic Wikimedia sister-project downloader.
@@ -376,8 +395,7 @@ def _download_wikimedia_project(project, label, est_size_mb, out_filename):
     chars = 0
     with open(out_file, "w", encoding="utf-8", buffering=IO_BUFFER) as out:
         for article_text in _extract_wiki_articles(dump_path):
-            out.write(article_text)
-            out.write("\n\n")
+            _write_doc(out, article_text)
             chars += len(article_text)
 
     print(f"  {label}: {chars:,} chars ({chars / 1024 / 1024:.0f} MB)")
@@ -397,27 +415,37 @@ def _download_wikimedia_project(project, label, est_size_mb, out_filename):
 def download_wikisource():
     """Armenian Wikisource: classical literature, chronicles, grabar texts."""
     return _download_wikimedia_project(
-        "hywikisource", "Armenian Wikisource", 100, "wikisource_hy.txt",
+        "hywikisource",
+        "Armenian Wikisource",
+        100,
+        "wikisource_hy.txt",
     )
 
 
 def download_wiktionary():
     """Armenian Wiktionary: dictionary definitions and usage examples."""
     return _download_wikimedia_project(
-        "hywiktionary", "Armenian Wiktionary", 40, "wiktionary_hy.txt",
+        "hywiktionary",
+        "Armenian Wiktionary",
+        40,
+        "wiktionary_hy.txt",
     )
 
 
 def download_wikiquote():
     """Armenian Wikiquote: literary quotations and proverbs (tiny, unique domain)."""
     return _download_wikimedia_project(
-        "hywikiquote", "Armenian Wikiquote", 3, "wikiquote_hy.txt",
+        "hywikiquote",
+        "Armenian Wikiquote",
+        3,
+        "wikiquote_hy.txt",
     )
 
 
 # -----------------------------------------------------------------------------
 # CC-100 (direct download, not HuggingFace)
 # -----------------------------------------------------------------------------
+
 
 def download_cc100():
     """Download and decompress CC-100 Armenian data to cc100_hy.txt.
@@ -452,8 +480,10 @@ def download_cc100():
 
     print("  Decompressing CC-100 (this takes a few minutes)...")
     chars = 0
-    with lzma.open(cc100_xz, "rt", encoding="utf-8") as f_in, \
-         open(out_file, "w", encoding="utf-8", buffering=IO_BUFFER) as f_out:
+    with (
+        lzma.open(cc100_xz, "rt", encoding="utf-8") as f_in,
+        open(out_file, "w", encoding="utf-8", buffering=IO_BUFFER) as f_out,
+    ):
         while True:
             chunk = f_in.read(IO_BUFFER)
             if not chunk:
@@ -521,6 +551,7 @@ def download_hplt3():
                 # bytes; we wrap again with TextIOWrapper for line iteration.
                 with dctx.stream_reader(resp) as reader:
                     import io as _io
+
                     text_stream = _io.TextIOWrapper(reader, encoding="utf-8")
                     for line in text_stream:
                         line = line.strip()
@@ -534,8 +565,7 @@ def download_hplt3():
                         text = text.strip()
                         if len(text) < 50:
                             continue
-                        fout.write(text)
-                        fout.write("\n\n")
+                        _write_doc(fout, text)
                         chars += len(text)
                         docs += 1
                         if docs % 50_000 == 0:
@@ -548,8 +578,10 @@ def download_hplt3():
                             )
 
     elapsed = time.time() - t0
-    print(f"  HPLT 3.0: {docs:,} docs, {chars:,} chars "
-          f"({chars / 1024 / 1024:.0f} MB) in {fmt_time(elapsed)}")
+    print(
+        f"  HPLT 3.0: {docs:,} docs, {chars:,} chars "
+        f"({chars / 1024 / 1024:.0f} MB) in {fmt_time(elapsed)}"
+    )
     return out_file
 
 
@@ -557,7 +589,9 @@ def download_hplt3():
 # ARLIS Armenian legislation database (direct HTTP, JSONL.xz with HTML body)
 # -----------------------------------------------------------------------------
 
-ARLIS_URL = "https://opendataam.sfo3.cdn.digitaloceanspaces.com/arlis/arlis_docs.jsonl.xz"
+ARLIS_URL = (
+    "https://opendataam.sfo3.cdn.digitaloceanspaces.com/arlis/arlis_docs.jsonl.xz"
+)
 
 
 def _strip_arlis_html(html):
@@ -568,6 +602,7 @@ def _strip_arlis_html(html):
     collapse whitespace. Keeps structure at paragraph level.
     """
     import html as _html
+
     text = _html.unescape(html)
     text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
     text = re.sub(r"</p\s*>", "\n\n", text, flags=re.IGNORECASE)
@@ -611,8 +646,10 @@ def download_arlis():
     chars = 0
     t0 = time.time()
 
-    with lzma.open(arlis_xz, "rt", encoding="utf-8") as f_in, \
-         open(out_file, "w", encoding="utf-8", buffering=IO_BUFFER) as f_out:
+    with (
+        lzma.open(arlis_xz, "rt", encoding="utf-8") as f_in,
+        open(out_file, "w", encoding="utf-8", buffering=IO_BUFFER) as f_out,
+    ):
         for line in f_in:
             line = line.strip()
             if not line:
@@ -626,22 +663,21 @@ def download_arlis():
             body = _strip_arlis_html(body_html)
             if len(body) < 100:
                 continue
-            if title:
-                f_out.write(title)
-                f_out.write("\n\n")
-                chars += len(title) + 2
-            f_out.write(body)
-            f_out.write("\n\n")
-            chars += len(body) + 2
+            # Title + body are one document; title becomes its first paragraph.
+            doc = f"{title}\n\n{body}" if title else body
+            _write_doc(f_out, doc)
+            chars += len(doc) + 2
             docs += 1
             if docs % 5000 == 0:
                 elapsed = time.time() - t0
                 rate = chars / elapsed / 1_000_000 if elapsed > 0 else 0
-                print(f"    {docs:,} docs, {chars / 1_000_000:.0f}M chars "
-                      f"({rate:.1f} MB/s)", flush=True)
+                print(
+                    f"    {docs:,} docs, {chars / 1_000_000:.0f}M chars "
+                    f"({rate:.1f} MB/s)",
+                    flush=True,
+                )
 
-    print(f"  ARLIS: {docs:,} docs, {chars:,} chars "
-          f"({chars / 1024 / 1024:.0f} MB)")
+    print(f"  ARLIS: {docs:,} docs, {chars:,} chars ({chars / 1024 / 1024:.0f} MB)")
 
     if os.path.exists(arlis_xz):
         os.remove(arlis_xz)
@@ -701,7 +737,7 @@ try:
                     continue
                 b = t.encode("utf-8")
                 fout.write(b)
-                fout.write(b"\n\n")
+                fout.write(_DOC_SUFFIX_BYTES)
                 chars += len(b) + 2
                 docs += 1
 except Exception as e:
@@ -749,9 +785,11 @@ def download_ccnews(max_parallel_downloads=8):
     if os.path.exists(out_file) and os.path.exists(progress_file):
         with open(progress_file) as f:
             done_shards = {line.strip() for line in f if line.strip()}
-        print(f"  CC-News resume: {len(done_shards)} shards already processed, "
-              f"existing output {os.path.getsize(out_file) / 1024 / 1024:.1f} MB",
-              flush=True)
+        print(
+            f"  CC-News resume: {len(done_shards)} shards already processed, "
+            f"existing output {os.path.getsize(out_file) / 1024 / 1024:.1f} MB",
+            flush=True,
+        )
     else:
         if os.path.exists(out_file):
             os.remove(out_file)
@@ -768,18 +806,23 @@ def download_ccnews(max_parallel_downloads=8):
         "stanford-oval/ccnews", repo_type="dataset", token=token
     )
     all_targets = sorted(
-        f for f in all_files
-        if f.endswith(".parquet")
-        and any(f.startswith(f"{y}_") for y in CCNEWS_YEARS)
+        f
+        for f in all_files
+        if f.endswith(".parquet") and any(f.startswith(f"{y}_") for y in CCNEWS_YEARS)
     )
     targets = [f for f in all_targets if f not in done_shards]
     if done_shards:
-        print(f"  CC-News: {len(targets)} shards remaining "
-              f"({len(done_shards)} already done, {len(all_targets)} total)",
-              flush=True)
+        print(
+            f"  CC-News: {len(targets)} shards remaining "
+            f"({len(done_shards)} already done, {len(all_targets)} total)",
+            flush=True,
+        )
     else:
-        print(f"  CC-News: {len(targets)} parquet shards to scan "
-              f"({'+'.join(CCNEWS_YEARS)})", flush=True)
+        print(
+            f"  CC-News: {len(targets)} parquet shards to scan "
+            f"({'+'.join(CCNEWS_YEARS)})",
+            flush=True,
+        )
     if not targets:
         return out_file
 
@@ -799,16 +842,18 @@ def download_ccnews(max_parallel_downloads=8):
         """
         import urllib.request
         import urllib.error
+
         url = (
-            f"https://huggingface.co/datasets/stanford-oval/ccnews/"
-            f"resolve/main/{fname}"
+            f"https://huggingface.co/datasets/stanford-oval/ccnews/resolve/main/{fname}"
         )
         out_path = os.path.join(tmpdir, fname)
         req = urllib.request.Request(url)
         if token:
             req.add_header("Authorization", f"Bearer {token}")
-        with urllib.request.urlopen(req, timeout=120) as resp, \
-             open(out_path, "wb") as f:
+        with (
+            urllib.request.urlopen(req, timeout=120) as resp,
+            open(out_path, "wb") as f,
+        ):
             while True:
                 chunk = resp.read(4 * 1024 * 1024)  # 4 MB pipe chunks
                 if not chunk:
@@ -816,9 +861,10 @@ def download_ccnews(max_parallel_downloads=8):
                 f.write(chunk)
         return out_path
 
-    with tempfile.TemporaryDirectory(dir=TEXT_TRAIN_DIR, prefix="ccnews_pq_") as tmpdir, \
-         ThreadPoolExecutor(max_workers=max_parallel_downloads) as pool:
-
+    with (
+        tempfile.TemporaryDirectory(dir=TEXT_TRAIN_DIR, prefix="ccnews_pq_") as tmpdir,
+        ThreadPoolExecutor(max_workers=max_parallel_downloads) as pool,
+    ):
         futures = {pool.submit(_direct_fetch, f, tmpdir): f for f in targets}
 
         for idx, future in enumerate(as_completed(futures), 1):
@@ -826,8 +872,10 @@ def download_ccnews(max_parallel_downloads=8):
             try:
                 path = future.result()
             except Exception as e:
-                print(f"  [{idx}/{len(targets)}] {fname}: download failed: {e}",
-                      flush=True)
+                print(
+                    f"  [{idx}/{len(targets)}] {fname}: download failed: {e}",
+                    flush=True,
+                )
                 continue
 
             # Run the scan in a FRESH subprocess (python -c <inlined src>).
@@ -840,8 +888,12 @@ def download_ccnews(max_parallel_downloads=8):
             try:
                 proc = subprocess.run(
                     [
-                        sys.executable, "-c", CCNEWS_SCAN_WORKER_SRC,
-                        path, out_file, str(IO_BUFFER),
+                        sys.executable,
+                        "-c",
+                        CCNEWS_SCAN_WORKER_SRC,
+                        path,
+                        out_file,
+                        str(IO_BUFFER),
                     ],
                     capture_output=True,
                     text=True,
@@ -902,14 +954,17 @@ def download_ccnews(max_parallel_downloads=8):
             )
 
     elapsed = time.time() - t_start
-    print(f"  CC-News: {total_docs:,} hy docs, {total_chars:,} chars "
-          f"({total_chars / 1024 / 1024:.0f} MB) in {fmt_time(elapsed)}")
+    print(
+        f"  CC-News: {total_docs:,} hy docs, {total_chars:,} chars "
+        f"({total_chars / 1024 / 1024:.0f} MB) in {fmt_time(elapsed)}"
+    )
     return out_file
 
 
 # -----------------------------------------------------------------------------
 # OpenSubtitles 2024 (HF, parallel corpus with src/tgt lang columns)
 # -----------------------------------------------------------------------------
+
 
 def download_opensubtitles():
     """Extract Armenian sides of Helsinki-NLP/OpenSubtitles2024.
@@ -943,8 +998,11 @@ def download_opensubtitles():
             print(f"  Streaming OpenSubtitles2024 [{split}] split...", flush=True)
             try:
                 ds = load_dataset(
-                    "Helsinki-NLP/OpenSubtitles2024", "default",
-                    split=split, streaming=True, token=hf_token,
+                    "Helsinki-NLP/OpenSubtitles2024",
+                    "default",
+                    split=split,
+                    streaming=True,
+                    token=hf_token,
                 )
             except Exception as e:
                 print(f"  [opensubtitles:{split}] load failed: {e}")
@@ -982,14 +1040,17 @@ def download_opensubtitles():
             gc.collect()
 
     elapsed = time.time() - t0
-    print(f"  OpenSubtitles: {docs:,} unique lines, {chars:,} chars "
-          f"({chars / 1024 / 1024:.1f} MB) in {fmt_time(elapsed)}")
+    print(
+        f"  OpenSubtitles: {docs:,} unique lines, {chars:,} chars "
+        f"({chars / 1024 / 1024:.1f} MB) in {fmt_time(elapsed)}"
+    )
     return out_file
 
 
 # -----------------------------------------------------------------------------
 # HuggingFace streaming download (runs as subprocess for parallelism)
 # -----------------------------------------------------------------------------
+
 
 def _download_hf_worker(args):
     """
@@ -1007,8 +1068,16 @@ def _download_hf_worker(args):
     dropped — used to pull Armenian-only rows from CC-News, which doesn't
     expose language as a config.
     """
-    (name, dataset_id, lang_config, text_field, out_file, hf_token,
-     filter_field, filter_value) = args
+    (
+        name,
+        dataset_id,
+        lang_config,
+        text_field,
+        out_file,
+        hf_token,
+        filter_field,
+        filter_value,
+    ) = args
 
     if os.path.exists(out_file):
         os.remove(out_file)
@@ -1020,8 +1089,11 @@ def _download_hf_worker(args):
     t0 = time.time()
 
     ds = load_dataset(
-        dataset_id, lang_config,
-        split="train", streaming=True, token=hf_token,
+        dataset_id,
+        lang_config,
+        split="train",
+        streaming=True,
+        token=hf_token,
     )
 
     chars = 0
@@ -1045,7 +1117,7 @@ def _download_hf_worker(args):
             if len(text) < 50:
                 continue
             write_buf.append(text)
-            write_buf.append("\n\n")
+            write_buf.append(_DOC_SUFFIX)
             buf_size += len(text) + 2
             chars += len(text)
             docs += 1
@@ -1119,13 +1191,19 @@ def download_corpus(args):
     # iterator on large filter-heavy scans.
     hf_sources = {
         "culturax": {
-            "repo": "uonlp/CulturaX", "config": "hy", "text_field": "text",
+            "repo": "uonlp/CulturaX",
+            "config": "hy",
+            "text_field": "text",
         },
         "mc4": {
-            "repo": "allenai/c4", "config": "hy", "text_field": "text",
+            "repo": "allenai/c4",
+            "config": "hy",
+            "text_field": "text",
         },
         "glot500": {
-            "repo": "cis-lmu/Glot500", "config": "hye_Armn", "text_field": "text",
+            "repo": "cis-lmu/Glot500",
+            "config": "hye_Armn",
+            "text_field": "text",
         },
         # FineTranslations is a parallel Armenian↔English corpus where the
         # Armenian side (`og_full_text`, og = "original") is the native
@@ -1146,20 +1224,21 @@ def download_corpus(args):
     if not hf_token:
         try:
             from huggingface_hub import get_token
+
             hf_token = get_token()
         except Exception:
             hf_token = None
 
-    print(f"{'='*60}")
-    print(f"  ArmGPT Corpus Download - Per-Source Files Mode")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
+    print("  ArmGPT Corpus Download - Per-Source Files Mode")
+    print(f"{'=' * 60}")
     print(f"  Output dir: {TEXT_TRAIN_DIR}")
     print(f"  HF cache:   {HF_CACHE_DIR}")
     print(f"  HF workers: {args.workers}")
     print(f"  HF auth:    {'token present' if hf_token else 'NONE (unauthenticated)'}")
     if skip:
         print(f"  Skipping:   {', '.join(skip)}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     t_start = time.time()
 
@@ -1242,7 +1321,9 @@ def download_corpus(args):
     elif _marker_exists("ccnews"):
         print("\n[CCNEWS] Already downloaded (marker + file on disk), skipping.")
     else:
-        print("\n[CCNEWS] Stanford CC-News 2023+2024 (direct parquet + pyarrow hy filter)")
+        print(
+            "\n[CCNEWS] Stanford CC-News 2023+2024 (direct parquet + pyarrow hy filter)"
+        )
         try:
             ccn_file = download_ccnews(max_parallel_downloads=8)
             if os.path.exists(ccn_file) and os.path.getsize(ccn_file) > 0:
@@ -1266,7 +1347,9 @@ def download_corpus(args):
     elif _marker_exists("opensubtitles"):
         print("\n[OPENSUBTITLES] Already downloaded (marker + file on disk), skipping.")
     else:
-        print("\n[OPENSUBTITLES] Helsinki-NLP/OpenSubtitles2024 (validation + test, hy filter)")
+        print(
+            "\n[OPENSUBTITLES] Helsinki-NLP/OpenSubtitles2024 (validation + test, hy filter)"
+        )
         try:
             os_file = download_opensubtitles()
             if os.path.exists(os_file) and os.path.getsize(os_file) > 0:
@@ -1290,36 +1373,41 @@ def download_corpus(args):
         if name in skip:
             print(f"[SKIP] {name}")
         elif _marker_exists(name):
-            print(f"[{name.upper()}] Already downloaded (marker + file on disk), skipping.")
+            print(
+                f"[{name.upper()}] Already downloaded (marker + file on disk), skipping."
+            )
         else:
             hf_to_download[name] = cfg
 
     if hf_to_download:
-        print(f"\n{'='*40}")
-        print(f"Phase 2: HuggingFace downloads ({len(hf_to_download)} sources in parallel)")
-        print(f"{'='*40}")
+        print(f"\n{'=' * 40}")
+        print(
+            f"Phase 2: HuggingFace downloads ({len(hf_to_download)} sources in parallel)"
+        )
+        print(f"{'=' * 40}")
 
         worker_args = []
         for name, cfg in hf_to_download.items():
             out_file = os.path.join(TEXT_TRAIN_DIR, f"{name}_hy.txt")
-            worker_args.append((
-                name,
-                cfg["repo"],
-                cfg["config"],
-                cfg["text_field"],
-                out_file,
-                hf_token,
-                cfg.get("filter_field"),
-                cfg.get("filter_value"),
-            ))
+            worker_args.append(
+                (
+                    name,
+                    cfg["repo"],
+                    cfg["config"],
+                    cfg["text_field"],
+                    out_file,
+                    hf_token,
+                    cfg.get("filter_field"),
+                    cfg.get("filter_value"),
+                )
+            )
 
         n_workers = min(args.workers, len(worker_args))
         print(f"  Launching {n_workers} parallel workers...\n")
 
         with ProcessPoolExecutor(max_workers=n_workers) as executor:
             futures = {
-                executor.submit(_download_hf_worker, wa): wa[0]
-                for wa in worker_args
+                executor.submit(_download_hf_worker, wa): wa[0] for wa in worker_args
             }
             for future in as_completed(futures):
                 name = futures[future]
@@ -1345,9 +1433,9 @@ def download_corpus(args):
                     print(f"  [{name}] Skipped - will be retried on next run.")
 
     # ---- Phase 3: Final cleanup ----
-    print(f"\n{'='*40}")
-    print(f"Phase 3: Cleanup")
-    print(f"{'='*40}")
+    print(f"\n{'=' * 40}")
+    print("Phase 3: Cleanup")
+    print(f"{'=' * 40}")
 
     clear_hf_cache()
 
@@ -1367,26 +1455,28 @@ def download_corpus(args):
 
     # Inventory the per-source files left on disk and report totals.
     source_files = sorted(
-        f for f in os.listdir(TEXT_TRAIN_DIR)
-        if f.endswith("_hy.txt")
-        and os.path.isfile(os.path.join(TEXT_TRAIN_DIR, f))
+        f
+        for f in os.listdir(TEXT_TRAIN_DIR)
+        if f.endswith("_hy.txt") and os.path.isfile(os.path.join(TEXT_TRAIN_DIR, f))
     )
     total_bytes = sum(
         os.path.getsize(os.path.join(TEXT_TRAIN_DIR, f)) for f in source_files
     )
-    total_gb = total_bytes / (1024 ** 3)
+    total_gb = total_bytes / (1024**3)
 
-    print(f"\n{'='*60}")
-    print(f"  Corpus Download Complete!")
-    print(f"{'='*60}")
+    print(f"\n{'=' * 60}")
+    print("  Corpus Download Complete!")
+    print(f"{'=' * 60}")
     print(f"  Sources on disk: {len(source_files)} files in {TEXT_TRAIN_DIR}")
     for f in source_files:
         size_mb = os.path.getsize(os.path.join(TEXT_TRAIN_DIR, f)) / (1024 * 1024)
         print(f"    {f:32s}  {size_mb:>8.0f} MB")
     print(f"  Total corpus:    {total_bytes:,} bytes ({total_gb:.2f} GB)")
     print(f"  Total time:      {fmt_time(elapsed)}")
-    print(f"\n  Next step: python 2_prepare.py  "
-          f"(tokenizer reads all {len(source_files)} source files at prep time)")
+    print(
+        f"\n  Next step: python 2_prepare.py  "
+        f"(tokenizer reads all {len(source_files)} source files at prep time)"
+    )
 
 
 # =============================================================================
@@ -1415,6 +1505,7 @@ _ARMENIAN_LETTERS = ["Ա", "Բ", "Գ", "Դ", "Ե", "Զ", "Է", "Ը", "Թ", "Ժ"]
 def _first_split(repo_id, config):
     """Load whatever split the config actually provides."""
     from datasets import load_dataset
+
     ds = load_dataset(repo_id, config)
     split = list(ds.keys())[0]
     return ds[split]
@@ -1482,14 +1573,19 @@ def _process_exam_config(cfg):
             answer = str(answer).strip()
             if not answer:
                 continue
-            instruction = (f"Տեքստ:\n{context}\n\nՀարց: {full_question}"
-                           if context else full_question)
-            out.append({
-                "instruction": instruction,
-                "input": "",
-                "output": answer,
-                "source": f"armbench/{cfg}/open",
-            })
+            instruction = (
+                f"Տեքստ:\n{context}\n\nՀարց: {full_question}"
+                if context
+                else full_question
+            )
+            out.append(
+                {
+                    "instruction": instruction,
+                    "input": "",
+                    "output": answer,
+                    "source": f"armbench/{cfg}/open",
+                }
+            )
             continue
 
         if tt in (1, 6):
@@ -1502,18 +1598,22 @@ def _process_exam_config(cfg):
                 continue
             try:
                 instruction, output = _format_mcq(
-                    full_question, choices, correct_idx,
+                    full_question,
+                    choices,
+                    correct_idx,
                     context=context or None,
                 )
             except ValueError:
                 skipped_by_tt[tt] = skipped_by_tt.get(tt, 0) + 1
                 continue
-            out.append({
-                "instruction": instruction,
-                "input": "",
-                "output": output,
-                "source": f"armbench/{cfg}/mcq",
-            })
+            out.append(
+                {
+                    "instruction": instruction,
+                    "input": "",
+                    "output": output,
+                    "source": f"armbench/{cfg}/mcq",
+                }
+            )
             continue
 
         skipped_by_tt[tt] = skipped_by_tt.get(tt, 0) + 1
@@ -1541,8 +1641,14 @@ def _process_include_mcqa(cfg="include-mcqa"):
         if not (0 <= correct_idx < 4):
             continue
         instruction, output = _format_mcq(question, choices, correct_idx)
-        out.append({"instruction": instruction, "input": "", "output": output,
-                    "source": f"armbench/{cfg}"})
+        out.append(
+            {
+                "instruction": instruction,
+                "input": "",
+                "output": output,
+                "source": f"armbench/{cfg}",
+            }
+        )
     return out
 
 
@@ -1561,12 +1667,14 @@ def _process_public_services(cfg="public-services-mcqa"):
         distractors = row.get("distractors") or []
         if not question or not answer:
             continue
-        out.append({
-            "instruction": question,
-            "input": "",
-            "output": answer,
-            "source": f"armbench/{cfg}/open",
-        })
+        out.append(
+            {
+                "instruction": question,
+                "input": "",
+                "output": answer,
+                "source": f"armbench/{cfg}/open",
+            }
+        )
         if distractors:
             rng = random.Random(hash(question) & 0xFFFFFFFF)  # deterministic per row
             choices = [answer] + list(distractors)
@@ -1575,12 +1683,14 @@ def _process_public_services(cfg="public-services-mcqa"):
             shuffled = [choices[i] for i in idxs]
             correct_idx = idxs.index(0)
             instruction, output = _format_mcq(question, shuffled, correct_idx)
-            out.append({
-                "instruction": instruction,
-                "input": "",
-                "output": output,
-                "source": f"armbench/{cfg}/mcq",
-            })
+            out.append(
+                {
+                    "instruction": instruction,
+                    "input": "",
+                    "output": output,
+                    "source": f"armbench/{cfg}/mcq",
+                }
+            )
     return out
 
 
@@ -1593,8 +1703,14 @@ def _process_simpleqa(cfg="simpleqa"):
         answer = (row.get("answer") or "").strip()
         if not question or not answer:
             continue
-        out.append({"instruction": question, "input": "", "output": answer,
-                    "source": f"armbench/{cfg}"})
+        out.append(
+            {
+                "instruction": question,
+                "input": "",
+                "output": answer,
+                "source": f"armbench/{cfg}",
+            }
+        )
     return out
 
 
@@ -1612,8 +1728,14 @@ def _process_squad_in_context(cfg="squad-in-context-qa"):
         if not question or not answer:
             continue
         instruction = f"Տեքստ:\n{context}\n\nՀարց: {question}" if context else question
-        out.append({"instruction": instruction, "input": "", "output": answer,
-                    "source": f"armbench/{cfg}"})
+        out.append(
+            {
+                "instruction": instruction,
+                "input": "",
+                "output": answer,
+                "source": f"armbench/{cfg}",
+            }
+        )
     return out
 
 
@@ -1633,10 +1755,17 @@ def _process_belebele(cfg="belebele-in-context-mcqa"):
             correct_idx = _normalize_single_label(correct, 4)
         except Exception:
             continue
-        instruction, output = _format_mcq(question, choices, correct_idx,
-                                          context=passage)
-        out.append({"instruction": instruction, "input": "", "output": output,
-                    "source": f"armbench/{cfg}"})
+        instruction, output = _format_mcq(
+            question, choices, correct_idx, context=passage
+        )
+        out.append(
+            {
+                "instruction": instruction,
+                "input": "",
+                "output": output,
+                "source": f"armbench/{cfg}",
+            }
+        )
     return out
 
 
@@ -1698,18 +1827,26 @@ _AYA_REPO = "CohereLabs/aya_collection_language_split"
 # Dropped after quality spot-check: Mintaka-inst (nonsense task format),
 # NQ-Open (MT mangles short factoid answers), WIKI QA (inverted direction).
 _AYA_SOURCE_PLAN = {
-    "Arpa-instruct":        None,    # native Armenian, take all (~4K)
-    "Dolly-v2 (T)":         None,    # ~14K, all
-    "Dolly-v2":             None,    # future-proof if they drop the (T)
-    "HotpotQA (T)":         10000,   # aggressive filter here, yields ~21%
-    "Adversarial QA (T)":   5000,
-    "Flan-CoT-submix (T)":  5000,
-    "Flan-unified-QA (T)":  None,    # ~540, take all
+    "Arpa-instruct": None,  # native Armenian, take all (~4K)
+    "Dolly-v2 (T)": None,  # ~14K, all
+    "Dolly-v2": None,  # future-proof if they drop the (T)
+    "HotpotQA (T)": 10000,  # aggressive filter here, yields ~21%
+    "Adversarial QA (T)": 5000,
+    "Flan-CoT-submix (T)": 5000,
+    "Flan-unified-QA (T)": None,  # ~540, take all
 }
 
 # Armenian Unicode ranges: main U+0530–U+058F, ligatures U+FB13–U+FB17
 _ARTIFACT_PATTERNS = [
-    "<unk>", "[unk]", "[UNK]", "<|", "|>", "{{", "}}", "[[", "]]",
+    "<unk>",
+    "[unk]",
+    "[UNK]",
+    "<|",
+    "|>",
+    "{{",
+    "}}",
+    "[[",
+    "]]",
 ]
 
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -1724,7 +1861,7 @@ def _armenian_letter_ratio(s):
     for c in s:
         if c.isalpha():
             alpha += 1
-            if ("\u0530" <= c <= "\u058F") or ("\uFB13" <= c <= "\uFB17"):
+            if ("\u0530" <= c <= "\u058f") or ("\ufb13" <= c <= "\ufb17"):
                 arm += 1
     if alpha == 0:
         return 0.0
@@ -1804,8 +1941,10 @@ def _aya_process_source(ds, name, n_samples, rng, filters):
             continue
         kept.append(pair)
     yield_rate = 100.0 * len(kept) / max(pool_size, 1)
-    print(f"  {name}: kept {len(kept):,} / {pool_size:,} "
-          f"({yield_rate:.1f}% yield, {dropped:,} dropped)")
+    print(
+        f"  {name}: kept {len(kept):,} / {pool_size:,} "
+        f"({yield_rate:.1f}% yield, {dropped:,} dropped)"
+    )
     return kept
 
 
@@ -1825,6 +1964,7 @@ def fetch_aya_qa(
     handled later by 2_prepare.py --qa.
     """
     from datasets import load_dataset
+
     rng = random.Random(seed)
     plan = plan or dict(_AYA_SOURCE_PLAN)
 
@@ -1867,13 +2007,15 @@ def fetch_aya_qa(
         unique.append(p)
 
     print(f"\n{'=' * 60}")
-    print(f"  Aya filtering complete")
+    print("  Aya filtering complete")
     print(f"{'=' * 60}")
     for name, count in per_source_counts.items():
         if count:
             print(f"  {name}: {count:,}")
-    print(f"  Total kept: {len(unique):,} "
-          f"(dropped {len(all_pairs) - len(unique):,} intra-source dupes)")
+    print(
+        f"  Total kept: {len(unique):,} "
+        f"(dropped {len(all_pairs) - len(unique):,} intra-source dupes)"
+    )
 
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(unique, f, ensure_ascii=False, indent=2)
@@ -1886,18 +2028,19 @@ def fetch_aya_qa(
 #                             Q&A download (--qa)
 # =============================================================================
 
+
 def download_qa(args):
     """Fetch SFT Q&A sources (ArmBench + Aya) into data/text/finetune/."""
     skip = set(s.lower() for s in args.skip)
 
-    print(f"{'='*60}")
-    print(f"  ArmGPT Q&A Download (SFT sources)")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
+    print("  ArmGPT Q&A Download (SFT sources)")
+    print(f"{'=' * 60}")
     print(f"  Output:    {TEXT_FINETUNE_DIR}")
     print(f"  HF cache:  {HF_CACHE_DIR}")
     if skip:
         print(f"  Skipping:  {', '.join(skip)}")
-    print(f"{'='*60}\n")
+    print(f"{'=' * 60}\n")
 
     t_start = time.time()
 
@@ -1919,12 +2062,12 @@ def download_qa(args):
         print("[SKIP] Aya")
 
     elapsed = time.time() - t_start
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  Q&A Download Complete!  ({fmt_time(elapsed)})")
-    print(f"{'='*60}")
-    print(f"  Optional: also run core/generate_armenian_qa.py to add")
-    print(f"            Claude-generated pairs under data/text/finetune/")
-    print(f"\n  Next step: python 2_prepare.py --qa")
+    print(f"{'=' * 60}")
+    print("  Optional: also run core/generate_armenian_qa.py to add")
+    print("            Claude-generated pairs under data/text/finetune/")
+    print("\n  Next step: python 2_prepare.py --qa")
 
 
 # =============================================================================
@@ -1954,30 +2097,66 @@ HF_TOKENIZED_DIR = "tokenized"
 # actual source list in sync — add an entry here whenever a new source
 # is wired into download_corpus().
 _HF_README_SOURCES = [
-    ("Armenian Wikipedia (hywiki)",              "CC BY-SA 4.0",
-     "https://dumps.wikimedia.org/hywiki/"),
-    ("Armenian Wikisource (hywikisource)",       "CC BY-SA 4.0",
-     "https://dumps.wikimedia.org/hywikisource/"),
-    ("Armenian Wiktionary (hywiktionary)",       "CC BY-SA 4.0",
-     "https://dumps.wikimedia.org/hywiktionary/"),
-    ("Armenian Wikiquote (hywikiquote)",         "CC BY-SA 4.0",
-     "https://dumps.wikimedia.org/hywikiquote/"),
-    ("CC-100 Armenian",                           "Common Crawl Terms of Use",
-     "https://data.statmt.org/cc-100/hy.txt.xz"),
-    ("HPLT 3.0 Armenian (hye_Armn)",              "CC0 1.0",
-     "https://data.hplt-project.org/three/sorted/hye_Armn.map"),
-    ("CulturaX Armenian (uonlp/CulturaX)",       "ODC-By 1.0",
-     "https://huggingface.co/datasets/uonlp/CulturaX"),
-    ("mC4 Armenian (allenai/c4)",                 "ODC-By 1.0",
-     "https://huggingface.co/datasets/allenai/c4"),
-    ("Glot500 Armenian (cis-lmu/Glot500)",       "Research use (mixed)",
-     "https://huggingface.co/datasets/cis-lmu/Glot500"),
-    ("ARLIS Armenian legislation database",       "Public domain (HY gov)",
-     "https://data.opendata.am/dataset/arlis-db"),
-    ("Stanford CC-News (hy filter)",             "Common Crawl Terms of Use",
-     "https://huggingface.co/datasets/stanford-oval/ccnews"),
-    ("FineTranslations Armenian (hye_Armn)",     "ODC-By 1.0",
-     "https://huggingface.co/datasets/HuggingFaceFW/finetranslations"),
+    (
+        "Armenian Wikipedia (hywiki)",
+        "CC BY-SA 4.0",
+        "https://dumps.wikimedia.org/hywiki/",
+    ),
+    (
+        "Armenian Wikisource (hywikisource)",
+        "CC BY-SA 4.0",
+        "https://dumps.wikimedia.org/hywikisource/",
+    ),
+    (
+        "Armenian Wiktionary (hywiktionary)",
+        "CC BY-SA 4.0",
+        "https://dumps.wikimedia.org/hywiktionary/",
+    ),
+    (
+        "Armenian Wikiquote (hywikiquote)",
+        "CC BY-SA 4.0",
+        "https://dumps.wikimedia.org/hywikiquote/",
+    ),
+    (
+        "CC-100 Armenian",
+        "Common Crawl Terms of Use",
+        "https://data.statmt.org/cc-100/hy.txt.xz",
+    ),
+    (
+        "HPLT 3.0 Armenian (hye_Armn)",
+        "CC0 1.0",
+        "https://data.hplt-project.org/three/sorted/hye_Armn.map",
+    ),
+    (
+        "CulturaX Armenian (uonlp/CulturaX)",
+        "ODC-By 1.0",
+        "https://huggingface.co/datasets/uonlp/CulturaX",
+    ),
+    (
+        "mC4 Armenian (allenai/c4)",
+        "ODC-By 1.0",
+        "https://huggingface.co/datasets/allenai/c4",
+    ),
+    (
+        "Glot500 Armenian (cis-lmu/Glot500)",
+        "Research use (mixed)",
+        "https://huggingface.co/datasets/cis-lmu/Glot500",
+    ),
+    (
+        "ARLIS Armenian legislation database",
+        "Public domain (HY gov)",
+        "https://data.opendata.am/dataset/arlis-db",
+    ),
+    (
+        "Stanford CC-News (hy filter)",
+        "Common Crawl Terms of Use",
+        "https://huggingface.co/datasets/stanford-oval/ccnews",
+    ),
+    (
+        "FineTranslations Armenian (hye_Armn)",
+        "ODC-By 1.0",
+        "https://huggingface.co/datasets/HuggingFaceFW/finetranslations",
+    ),
 ]
 
 
@@ -1988,8 +2167,7 @@ def _build_hf_readme(corpus_stats=None, qa_files=None):
     quick-start loading examples.
     """
     attribution = "\n".join(
-        f"- **{name}** — {lic}  \n  {url}"
-        for (name, lic, url) in _HF_README_SOURCES
+        f"- **{name}** — {lic}  \n  {url}" for (name, lic, url) in _HF_README_SOURCES
     )
 
     corpus_block = ""
@@ -2114,14 +2292,17 @@ def _compress_zstd(src_path, dst_path, level=12):
     total_in = os.path.getsize(src_path)
     t0 = time.time()
     with open(src_path, "rb") as fin, open(dst_path, "wb") as fout:
-        cctx.copy_stream(fin, fout, read_size=16 * 1024 * 1024,
-                         write_size=16 * 1024 * 1024)
+        cctx.copy_stream(
+            fin, fout, read_size=16 * 1024 * 1024, write_size=16 * 1024 * 1024
+        )
     total_out = os.path.getsize(dst_path)
     elapsed = time.time() - t0
     ratio = total_in / total_out if total_out else 0
-    print(f"  zstd L{level}: {total_in / 1024 ** 3:.2f} GB -> "
-          f"{total_out / 1024 ** 3:.2f} GB "
-          f"({ratio:.1f}x ratio) in {fmt_time(elapsed)}")
+    print(
+        f"  zstd L{level}: {total_in / 1024**3:.2f} GB -> "
+        f"{total_out / 1024**3:.2f} GB "
+        f"({ratio:.1f}x ratio) in {fmt_time(elapsed)}"
+    )
     return total_in, total_out
 
 
@@ -2135,16 +2316,20 @@ def _decompress_zstd(src_path, dst_path):
     dctx = zstd.ZstdDecompressor()
     t0 = time.time()
     with open(src_path, "rb") as fin, open(dst_path, "wb") as fout:
-        dctx.copy_stream(fin, fout, read_size=64 * 1024 * 1024,
-                         write_size=64 * 1024 * 1024)
+        dctx.copy_stream(
+            fin, fout, read_size=64 * 1024 * 1024, write_size=64 * 1024 * 1024
+        )
     total_out = os.path.getsize(dst_path)
     elapsed = time.time() - t0
-    print(f"  unzstd: {os.path.getsize(src_path) / 1024 ** 3:.2f} GB -> "
-          f"{total_out / 1024 ** 3:.2f} GB in {fmt_time(elapsed)}")
+    print(
+        f"  unzstd: {os.path.getsize(src_path) / 1024**3:.2f} GB -> "
+        f"{total_out / 1024**3:.2f} GB in {fmt_time(elapsed)}"
+    )
 
 
-def upload_dataset_to_hf(repo_id, corpus_path, finetune_dir, token=None,
-                         tokenized=False, data_dir=None):
+def upload_dataset_to_hf(
+    repo_id, corpus_path, finetune_dir, token=None, tokenized=False, data_dir=None
+):
     """Upload the clean corpus + Q&A bundle to a HF dataset repo.
 
     Layout written to the repo (existing unrelated files are deleted):
@@ -2213,19 +2398,18 @@ def upload_dataset_to_hf(repo_id, corpus_path, finetune_dir, token=None,
         os.makedirs(stage_finetune, exist_ok=True)
 
         # Compress corpus
-        print(f"\n{'='*60}")
-        print(f"  Step 1/3: Compressing corpus")
-        print(f"{'='*60}")
+        print(f"\n{'=' * 60}")
+        print("  Step 1/3: Compressing corpus")
+        print(f"{'=' * 60}")
         out_zst = os.path.join(stage_corpus, "clean_text.txt.zst")
         raw_size, zst_size = _compress_zstd(corpus_path, out_zst, level=12)
 
         # Copy QA files
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"  Step 2/3: Staging Q&A files ({len(qa_files)})")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         for f in qa_files:
-            shutil.copy2(os.path.join(finetune_dir, f),
-                         os.path.join(stage_finetune, f))
+            shutil.copy2(os.path.join(finetune_dir, f), os.path.join(stage_finetune, f))
             print(f"  {f}")
 
         # Paragraph count from clean_stats.json (if exists) for the README
@@ -2261,8 +2445,8 @@ def upload_dataset_to_hf(repo_id, corpus_path, finetune_dir, token=None,
 
         readme = _build_hf_readme(
             corpus_stats={
-                "uncompressed_gb": raw_size / 1024 ** 3,
-                "compressed_gb": zst_size / 1024 ** 3,
+                "uncompressed_gb": raw_size / 1024**3,
+                "compressed_gb": zst_size / 1024**3,
                 "paragraphs": paragraphs,
             },
             qa_files=qa_summary,
@@ -2287,18 +2471,21 @@ def upload_dataset_to_hf(repo_id, corpus_path, finetune_dir, token=None,
             print(f"  No existing repo to delete: {e}")
 
         print(f"Creating fresh dataset repo: {repo_id}")
-        api.create_repo(repo_id=repo_id, repo_type="dataset",
-                        private=True, exist_ok=True)
+        api.create_repo(
+            repo_id=repo_id, repo_type="dataset", private=True, exist_ok=True
+        )
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"  Step 3/3: Uploading to {repo_id}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"  Staged contents: {staging}")
         print()
         t0 = time.time()
-        commit_msg = (f"Upload corpus + Q&A bundle "
-                      f"(corpus {zst_size / 1024 ** 3:.1f} GB compressed, "
-                      f"{len(qa_files)} Q&A files)")
+        commit_msg = (
+            f"Upload corpus + Q&A bundle "
+            f"(corpus {zst_size / 1024**3:.1f} GB compressed, "
+            f"{len(qa_files)} Q&A files)"
+        )
         api.upload_folder(
             folder_path=staging,
             repo_id=repo_id,
@@ -2309,17 +2496,17 @@ def upload_dataset_to_hf(repo_id, corpus_path, finetune_dir, token=None,
         print(f"  Upload complete in {fmt_time(elapsed)}")
 
     # Reclaim LFS orphan quota after the sync
-    print(f"\n{'='*60}")
-    print(f"  Post-upload: sweeping LFS orphans")
-    print(f"{'='*60}")
+    print(f"\n{'=' * 60}")
+    print("  Post-upload: sweeping LFS orphans")
+    print(f"{'=' * 60}")
     try:
         _lfs_orphan_cleanup(api, repo_id)
     except Exception as e:
         print(f"  LFS orphan cleanup skipped: {e}")
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  Done -> https://huggingface.co/datasets/{repo_id}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
 
 def _lfs_orphan_cleanup(api, repo_id):
@@ -2330,17 +2517,25 @@ def _lfs_orphan_cleanup(api, repo_id):
     if not orphans:
         print("  No orphaned LFS blobs.")
         return
-    size_gb = sum(f.size for f in orphans) / 1024 ** 3
+    size_gb = sum(f.size for f in orphans) / 1024**3
     print(f"  Freeing {size_gb:.2f} GB across {len(orphans)} orphan LFS blobs...")
     api.permanently_delete_lfs_files(
-        repo_id=repo_id, repo_type="dataset", lfs_files=orphans,
+        repo_id=repo_id,
+        repo_type="dataset",
+        lfs_files=orphans,
     )
-    print(f"  Done.")
+    print("  Done.")
 
 
-def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None,
-                             tokenized=False, tokenized_only=False,
-                             data_dir=None):
+def download_dataset_from_hf(
+    repo_id,
+    train_dir,
+    finetune_dir,
+    token=None,
+    tokenized=False,
+    tokenized_only=False,
+    data_dir=None,
+):
     """Fetch the published corpus + Q&A bundle back into data/text/{train,finetune}/.
 
     This is the counterpart to ``--upload``: reconstructs the local
@@ -2368,9 +2563,9 @@ def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None,
 
     clean_out = None
     if not tokenized_only:
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"  Step 1/3: Fetching corpus from {repo_id}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         try:
             zst_path = hf_hub_download(
                 repo_id=repo_id,
@@ -2381,25 +2576,26 @@ def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None,
             )
         except Exception as e:
             print(f"Error fetching {HF_CORPUS_PATH}: {e}")
-            print(f"Check that the repo exists and has been populated via --upload.")
+            print("Check that the repo exists and has been populated via --upload.")
             sys.exit(1)
 
         print(f"  Downloaded: {zst_path}")
 
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"  Step 2/3: Decompressing -> {train_dir}/clean_text.txt")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         clean_out = os.path.join(train_dir, "clean_text.txt")
         _decompress_zstd(zst_path, clean_out)
 
         # Fetch Q&A files
-        print(f"\n{'='*60}")
-        print(f"  Step 3/3: Fetching Q&A files")
-        print(f"{'='*60}")
+        print(f"\n{'=' * 60}")
+        print("  Step 3/3: Fetching Q&A files")
+        print(f"{'=' * 60}")
         api = HfApi(token=token)
         all_files = api.list_repo_files(repo_id, repo_type="dataset", token=token)
         qa_files = [
-            f for f in all_files
+            f
+            for f in all_files
             if f.startswith(f"{HF_FINETUNE_DIR}/") and f.endswith(".json")
         ]
         for hf_path in qa_files:
@@ -2416,9 +2612,9 @@ def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None,
 
     # Fetch pre-tokenized BPE bins if requested
     if tokenized and data_dir:
-        print(f"\n{'='*60}")
-        print(f"  Step 4: Fetching pre-tokenized BPE data")
-        print(f"{'='*60}")
+        print(f"\n{'=' * 60}")
+        print("  Step 4: Fetching pre-tokenized BPE data")
+        print(f"{'=' * 60}")
         os.makedirs(data_dir, exist_ok=True)
 
         # Compressed bins
@@ -2426,8 +2622,11 @@ def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None,
             hf_path = f"{HF_TOKENIZED_DIR}/{name}"
             try:
                 cached = hf_hub_download(
-                    repo_id=repo_id, filename=hf_path,
-                    repo_type="dataset", token=token, cache_dir=HF_CACHE_DIR,
+                    repo_id=repo_id,
+                    filename=hf_path,
+                    repo_type="dataset",
+                    token=token,
+                    cache_dir=HF_CACHE_DIR,
                 )
                 out_path = os.path.join(data_dir, name.removesuffix(".zst"))
                 print(f"  Decompressing {name}...")
@@ -2440,8 +2639,11 @@ def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None,
             hf_path = f"{HF_TOKENIZED_DIR}/{name}"
             try:
                 cached = hf_hub_download(
-                    repo_id=repo_id, filename=hf_path,
-                    repo_type="dataset", token=token, cache_dir=HF_CACHE_DIR,
+                    repo_id=repo_id,
+                    filename=hf_path,
+                    repo_type="dataset",
+                    token=token,
+                    cache_dir=HF_CACHE_DIR,
                 )
                 shutil.copy2(cached, os.path.join(data_dir, name))
                 print(f"  {name}")
@@ -2454,53 +2656,80 @@ def download_dataset_from_hf(repo_id, train_dir, finetune_dir, token=None,
         with open(os.path.join(train_dir, ".downloaded_from_hf"), "w") as f:
             f.write(f"{repo_id}\n")
 
-    print(f"\n{'='*60}")
-    print(f"  Done")
-    print(f"{'='*60}")
+    print(f"\n{'=' * 60}")
+    print("  Done")
+    print(f"{'=' * 60}")
     if clean_out:
         print(f"  Corpus:   {clean_out}")
         print(f"  Q&A dir:  {finetune_dir}")
     if tokenized:
         print(f"  Tokenized: {data_dir}")
         print()
-        print(f"  Next step: python 4_train.py --preset tiny --tokenizer bpe")
+        print("  Next step: python 4_train.py --preset tiny --tokenizer bpe")
     else:
         print()
-        print(f"  Next step: python 3_tokenize.py --tokenizer bpe")
+        print("  Next step: python 3_tokenize.py --tokenizer bpe")
 
 
 # =============================================================================
 #                                    Main
 # =============================================================================
 
+
 def main():
     parser = argparse.ArgumentParser(
         description="Download Armenian text data (corpus by default, or --qa for SFT sources)"
     )
-    parser.add_argument("--qa", action="store_true",
-                        help="Download SFT Q&A sources (ArmBench + Aya) instead of raw corpus")
-    parser.add_argument("--skip", nargs="*", default=[],
-                        help="Sources to skip. Corpus: wiki wikisource wiktionary wikiquote "
-                             "cc100 hplt3 arlis ccnews opensubtitles culturax mc4 glot500 "
-                             "finetranslations. QA: armbench aya")
-    parser.add_argument("--workers", type=int, default=5,
-                        help="Max parallel HF downloads (corpus mode only; default: 5)")
+    parser.add_argument(
+        "--qa",
+        action="store_true",
+        help="Download SFT Q&A sources (ArmBench + Aya) instead of raw corpus",
+    )
+    parser.add_argument(
+        "--skip",
+        nargs="*",
+        default=[],
+        help="Sources to skip. Corpus: wiki wikisource wiktionary wikiquote "
+        "cc100 hplt3 arlis ccnews opensubtitles culturax mc4 glot500 "
+        "finetranslations. QA: armbench aya",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=5,
+        help="Max parallel HF downloads (corpus mode only; default: 5)",
+    )
 
     # HF publish / fetch
-    parser.add_argument("--upload", action="store_true",
-                        help="Package clean_text.txt + Q&A files and push to HF "
-                             f"(default repo: {DEFAULT_HF_DATASET_REPO})")
-    parser.add_argument("--download", action="store_true",
-                        help="Fetch the published corpus + Q&A from HF instead of "
-                             "running the full source-download pipeline")
-    parser.add_argument("--tokenized", action="store_true",
-                        help="Include pre-tokenized BPE bins in --upload/--download "
-                             "(train_bpe.bin, val_bpe.bin, tokenizer_bpe.json)")
-    parser.add_argument("--tokenized-only", action="store_true",
-                        help="With --download: fetch ONLY the tokenized BPE bins, "
-                             "skip corpus and Q&A")
-    parser.add_argument("--hf-repo", type=str, default=DEFAULT_HF_DATASET_REPO,
-                        help="Override the HF dataset repo for --upload/--download")
+    parser.add_argument(
+        "--upload",
+        action="store_true",
+        help="Package clean_text.txt + Q&A files and push to HF "
+        f"(default repo: {DEFAULT_HF_DATASET_REPO})",
+    )
+    parser.add_argument(
+        "--download",
+        action="store_true",
+        help="Fetch the published corpus + Q&A from HF instead of "
+        "running the full source-download pipeline",
+    )
+    parser.add_argument(
+        "--tokenized",
+        action="store_true",
+        help="Include pre-tokenized BPE bins in --upload/--download "
+        "(train_bpe.bin, val_bpe.bin, tokenizer_bpe.json)",
+    )
+    parser.add_argument(
+        "--tokenized-only",
+        action="store_true",
+        help="With --download: fetch ONLY the tokenized BPE bins, skip corpus and Q&A",
+    )
+    parser.add_argument(
+        "--hf-repo",
+        type=str,
+        default=DEFAULT_HF_DATASET_REPO,
+        help="Override the HF dataset repo for --upload/--download",
+    )
 
     args = parser.parse_args()
 

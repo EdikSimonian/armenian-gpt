@@ -38,6 +38,8 @@ from multiprocessing import Pool, cpu_count
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from core import DOC_SEPARATOR  # noqa: E402  shared sentinel (1_download/2_prepare)
+
 _REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(_REPO_ROOT, "data")
 TEXT_TRAIN_DIR = os.path.join(DATA_DIR, "text", "train")
@@ -66,6 +68,7 @@ def _find_segment_boundaries(path, num_segments):
 def build_char_vocab(clean_path, chunk_bytes=50_000_000):
     """Scan the clean file to build character vocabulary without loading it all."""
     from core.char_tokenizer import CharTokenizer
+
     tokenizer = CharTokenizer()
     chars = set()
 
@@ -89,12 +92,17 @@ def encode_char_chunked(clean_path, tokenizer, output_path, chunk_bytes=50_000_0
         lookup[ord(ch)] = idx
 
     total_tokens = 0
-    with open(clean_path, "r", encoding="utf-8") as fin, \
-         open(output_path, "wb") as fout:
+    with (
+        open(clean_path, "r", encoding="utf-8") as fin,
+        open(output_path, "wb") as fout,
+    ):
         while True:
             chunk = fin.read(chunk_bytes)
             if not chunk:
                 break
+            # Char path is legacy (BPE is the project default); it has no EOS
+            # concept, so document separators are simply dropped here.
+            chunk = chunk.replace(DOC_SEPARATOR, "")
             codepoints = np.array([ord(ch) for ch in chunk], dtype=np.int32)
             valid = codepoints[codepoints < max_cp]
             token_ids = lookup[valid]
@@ -105,16 +113,41 @@ def encode_char_chunked(clean_path, tokenizer, output_path, chunk_bytes=50_000_0
     return total_tokens
 
 
+def _encode_text_with_eos(sp, text, eos_id):
+    """Encode `text`, replacing each document-separator sentinel with the EOS
+    id. The blank lines 2_prepare put around the sentinel are dropped so
+    documents join as `...last sentence. <eos> next document...` rather than
+    carrying stray newline tokens around the boundary. Most chunks contain no
+    sentinel and take the fast path."""
+    if DOC_SEPARATOR not in text:
+        return sp.encode(text)
+    parts = text.split(DOC_SEPARATOR)
+    ids = []
+    last = len(parts) - 1
+    for i, part in enumerate(parts):
+        if i > 0:
+            ids.append(eos_id)
+            part = part.lstrip("\n")  # blank line that followed the separator
+        if i < last:
+            part = part.rstrip("\n")  # blank line that preceded the separator
+        if part:
+            ids.extend(sp.encode(part))
+    return ids
+
+
 def _encode_bpe_segment(args):
     """Encode one segment of clean text with BPE (for multiprocessing)."""
     clean_path, start_byte, end_byte, segment_id, model_proto_hex = args
     import sentencepiece as spm
+
     sp = spm.SentencePieceProcessor()
     sp.load_from_serialized_proto(bytes.fromhex(model_proto_hex))
+    eos_id = sp.eos_id()
 
     out_path = os.path.join(DATA_DIR, f"encode_seg_{segment_id}.bin")
     chunk_size = 10_000_000
     total_tokens = 0
+    total_chars = 0
 
     with open(clean_path, "rb") as fin, open(out_path, "wb") as fout:
         fin.seek(start_byte)
@@ -129,7 +162,7 @@ def _encode_bpe_segment(args):
                 if extra:
                     nl = extra.find(b"\n")
                     if nl != -1:
-                        raw_bytes += extra[:nl + 1]
+                        raw_bytes += extra[: nl + 1]
                         fin.seek(-(len(extra) - nl - 1), 1)
                     else:
                         raw_bytes += extra
@@ -147,18 +180,20 @@ def _encode_bpe_segment(args):
                     continue
             to_encode = buffer[:split_at]
             buffer = buffer[split_at:]
-            ids = sp.encode(to_encode)
+            ids = _encode_text_with_eos(sp, to_encode, eos_id)
             np.array(ids, dtype=np.uint16).tofile(fout)
             total_tokens += len(ids)
+            total_chars += len(to_encode)
 
         if buffer:
-            ids = sp.encode(buffer)
+            ids = _encode_text_with_eos(sp, buffer, eos_id)
             np.array(ids, dtype=np.uint16).tofile(fout)
             total_tokens += len(ids)
+            total_chars += len(buffer)
 
     seg_mb = (end_byte - start_byte) / (1024 * 1024)
     print(f"  Segment {segment_id}: {seg_mb:.0f} MB -> {total_tokens:,} tokens")
-    return out_path, total_tokens
+    return out_path, total_tokens, total_chars
 
 
 def encode_bpe_chunked(clean_path, tokenizer, output_path):
@@ -166,7 +201,9 @@ def encode_bpe_chunked(clean_path, tokenizer, output_path):
     total_bytes = os.path.getsize(clean_path)
     num_workers = min(cpu_count(), 16)
 
-    print(f"  Encoding {total_bytes / 1024 / 1024:.0f} MB with {num_workers} parallel workers...")
+    print(
+        f"  Encoding {total_bytes / 1024 / 1024:.0f} MB with {num_workers} parallel workers..."
+    )
     boundaries = _find_segment_boundaries(clean_path, num_workers)
     model_proto_hex = tokenizer.sp.serialized_model_proto().hex()
     args = [
@@ -178,9 +215,11 @@ def encode_bpe_chunked(clean_path, tokenizer, output_path):
         results = pool.map(_encode_bpe_segment, args)
 
     total_tokens = 0
+    total_chars = 0
     with open(output_path, "wb") as fout:
-        for seg_path, seg_tokens in results:
+        for seg_path, seg_tokens, seg_chars in results:
             total_tokens += seg_tokens
+            total_chars += seg_chars
             with open(seg_path, "rb") as fin:
                 while True:
                     chunk = fin.read(100 * 1024 * 1024)
@@ -189,18 +228,43 @@ def encode_bpe_chunked(clean_path, tokenizer, output_path):
                     fout.write(chunk)
             os.remove(seg_path)
 
+    if total_tokens:
+        print(
+            f"  Compression: {total_chars / total_tokens:.2f} chars/token "
+            f"({total_chars:,} chars -> {total_tokens:,} tokens)"
+        )
     return total_tokens
 
 
-def split_bin_file(all_tokens_path, train_path, val_path, val_ratio=0.1):
-    """Split a single .bin file into train and val without loading into RAM."""
+def split_bin_file(all_tokens_path, train_path, val_path, val_ratio=0.1, eos_id=None):
+    """Split a single .bin file into train and val without loading into RAM.
+
+    When `eos_id` is given, the split point is nudged forward to the next EOS
+    (document boundary) so the validation set begins at a clean document start
+    instead of bisecting one — a bisected document would put a passage's prefix
+    in train and its suffix in val, leaking context and softening val loss.
+    """
     total_bytes = os.path.getsize(all_tokens_path)
     total_tokens = total_bytes // 2  # uint16 = 2 bytes per token
     split_token = int(total_tokens * (1 - val_ratio))
+
+    if eos_id is not None and 0 < split_token < total_tokens:
+        # Scan forward from the nominal split for the next EOS token; val starts
+        # just after it. Bounded so a corpus without EOS can't scan the whole
+        # tail — falls back to the raw offset after 5M tokens (~no doc breaks).
+        mm = np.memmap(all_tokens_path, dtype=np.uint16, mode="r")
+        limit = min(total_tokens, split_token + 5_000_000)
+        nxt = np.where(mm[split_token:limit] == eos_id)[0]
+        if len(nxt):
+            split_token = split_token + int(nxt[0]) + 1  # token after the EOS
+        del mm
+
     split_byte = split_token * 2
 
     print(f"  Total tokens: {total_tokens:,}")
-    print(f"  Train: {split_token:,} tokens, Val: {total_tokens - split_token:,} tokens")
+    print(
+        f"  Train: {split_token:,} tokens, Val: {total_tokens - split_token:,} tokens"
+    )
 
     chunk_size = 100 * 1024 * 1024
     with open(all_tokens_path, "rb") as fin:
@@ -225,53 +289,90 @@ def split_bin_file(all_tokens_path, train_path, val_path, val_ratio=0.1):
     print(f"  Val:   {os.path.getsize(val_path) / 1024 / 1024:.1f} MB")
 
 
-def tokenize_corpus(tokenizer_type):
+def _write_separator_free_copy(clean_path):
+    """Stream a copy of the clean corpus with document-separator lines removed,
+    for tokenizer TRAINING only. The sentinel must never enter the BPE/char
+    vocabulary — it is a structural marker, replaced by EOS at encode time.
+    Returns the temp path (caller deletes it)."""
+    tmp_path = clean_path + ".notrain.tmp"
+    n_dropped = 0
+    with (
+        open(clean_path, "r", encoding="utf-8", errors="ignore") as fin,
+        open(tmp_path, "w", encoding="utf-8", buffering=16 * 1024 * 1024) as fout,
+    ):
+        for line in fin:
+            if line.strip() == DOC_SEPARATOR:
+                n_dropped += 1
+                continue
+            fout.write(line)
+    print(f"  (filtered {n_dropped:,} separator lines from tokenizer training input)")
+    return tmp_path
+
+
+def tokenize_corpus(tokenizer_type, vocab_size=32000):
     if not os.path.exists(CLEAN_FILE):
         print(f"Error: {CLEAN_FILE} not found!")
         print("Run 'python 2_prepare.py' first to clean the data.")
         sys.exit(1)
 
     clean_size = os.path.getsize(CLEAN_FILE)
-    print(f"\n{'='*50}")
-    print(f"  Step 3: Train tokenizer and encode")
-    print(f"{'='*50}")
+    print(f"\n{'=' * 50}")
+    print("  Step 3: Train tokenizer and encode")
+    print(f"{'=' * 50}")
     print(f"  Input:     {CLEAN_FILE} ({clean_size / 1024 / 1024:.0f} MB)")
     print(f"  Tokenizer: {tokenizer_type}")
-    print(f"{'='*50}\n")
+    if tokenizer_type == "bpe":
+        print(f"  Vocab:     {vocab_size}")
+    print(f"{'=' * 50}\n")
 
     print("Step 3a: Building tokenizer...")
     all_tokens_path = os.path.join(DATA_DIR, "all_tokens.bin")
+    eos_id = None
 
-    if tokenizer_type == "char":
-        tokenizer = build_char_vocab(CLEAN_FILE)
-        print(f"  Vocabulary: {tokenizer.vocab_size} characters")
+    # Tokenizer trains on a separator-free copy; encoding reads the real file
+    # (with separators) and converts each sentinel to EOS.
+    train_input = _write_separator_free_copy(CLEAN_FILE)
+    try:
+        if tokenizer_type == "char":
+            tokenizer = build_char_vocab(train_input)
+            print(f"  Vocabulary: {tokenizer.vocab_size} characters")
 
-        print("\nStep 3b: Encoding text...")
-        total_tokens = encode_char_chunked(CLEAN_FILE, tokenizer, all_tokens_path)
-    else:
-        from core.bpe_tokenizer import BPETokenizer
-        tokenizer = BPETokenizer()
-        tokenizer.train(CLEAN_FILE, model_prefix=os.path.join(DATA_DIR, "bpe_model"))
-        print(f"  Vocabulary: {tokenizer.vocab_size} tokens")
+            print("\nStep 3b: Encoding text...")
+            total_tokens = encode_char_chunked(CLEAN_FILE, tokenizer, all_tokens_path)
+        else:
+            from core.bpe_tokenizer import BPETokenizer
 
-        print("\nStep 3b: Encoding text...")
-        total_tokens = encode_bpe_chunked(CLEAN_FILE, tokenizer, all_tokens_path)
+            tokenizer = BPETokenizer()
+            tokenizer.train(
+                train_input,
+                model_prefix=os.path.join(DATA_DIR, "bpe_model"),
+                vocab_size=vocab_size,
+            )
+            eos_id = tokenizer.eos_id
+            print(f"  Vocabulary: {tokenizer.vocab_size} tokens")
+
+            print("\nStep 3b: Encoding text...")
+            total_tokens = encode_bpe_chunked(CLEAN_FILE, tokenizer, all_tokens_path)
+    finally:
+        if os.path.exists(train_input):
+            os.remove(train_input)
 
     print(f"  Total tokens: {total_tokens:,}")
 
-    print("\nStep 3c: Splitting train/val (90/10)...")
+    print("\nStep 3c: Splitting train/val (90/10, snapped to a document boundary)...")
     from core import bin_paths, tokenizer_path
+
     train_path, val_path = bin_paths(DATA_DIR, tokenizer_type)
-    split_bin_file(all_tokens_path, train_path, val_path)
+    split_bin_file(all_tokens_path, train_path, val_path, eos_id=eos_id)
 
     os.remove(all_tokens_path)
 
     tok_path = tokenizer_path(DATA_DIR, tokenizer_type)
     tokenizer.save(tok_path)
 
-    print(f"\n{'='*50}")
-    print(f"  Step 3 complete")
-    print(f"{'='*50}")
+    print(f"\n{'=' * 50}")
+    print("  Step 3 complete")
+    print(f"{'=' * 50}")
     print(f"  Tokenizer:    {tokenizer_type} ({tokenizer.vocab_size} tokens)")
     print(f"  Train tokens: {os.path.getsize(train_path) // 2:,} ({train_path})")
     print(f"  Val tokens:   {os.path.getsize(val_path) // 2:,} ({val_path})")
@@ -289,32 +390,47 @@ def tokenize_qa(tokenizer_type):
         print("Run 'python 2_prepare.py --qa' first to merge SFT sources.")
         sys.exit(1)
 
-    print(f"\n{'='*50}")
-    print(f"  Step 3: Tokenize chat data (--qa)")
-    print(f"{'='*50}")
+    print(f"\n{'=' * 50}")
+    print("  Step 3: Tokenize chat data (--qa)")
+    print(f"{'=' * 50}")
     print(f"  Input:     {source_path}")
     print(f"  Tokenizer: {tokenizer_type} (extended with chat special tokens)")
-    print(f"{'='*50}\n")
+    print(f"{'=' * 50}\n")
 
     prepare_chat_data(source_path, tokenizer_type)
 
-    print(f"\nNext step: python 6_finetune.py")
+    print("\nNext step: python 6_finetune.py")
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--tokenizer", type=str, required=True,
-                        choices=["char", "bpe"],
-                        help="Tokenizer type: 'char' (Level 1) or 'bpe' (Level 2)")
-    parser.add_argument("--qa", action="store_true",
-                        help="Tokenize Q&A data (data/text/finetune/qa_merged.json) into data_chat/ "
-                             "instead of the raw corpus")
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        required=True,
+        choices=["char", "bpe"],
+        help="Tokenizer type: 'char' (Level 1) or 'bpe' (Level 2)",
+    )
+    parser.add_argument(
+        "--qa",
+        action="store_true",
+        help="Tokenize Q&A data (data/text/finetune/qa_merged.json) into data_chat/ "
+        "instead of the raw corpus",
+    )
+    parser.add_argument(
+        "--vocab_size",
+        type=int,
+        default=32000,
+        help="BPE vocabulary size (corpus mode only). Default 32000; 16000 was "
+        "the v1 value. Larger vocab = fewer tokens per char = more text per "
+        "context window. Check the printed chars/token to tune.",
+    )
     args = parser.parse_args()
 
     if args.qa:
         tokenize_qa(args.tokenizer)
     else:
-        tokenize_corpus(args.tokenizer)
+        tokenize_corpus(args.tokenizer, vocab_size=args.vocab_size)
 
 
 if __name__ == "__main__":

@@ -24,6 +24,14 @@ The helpers centralize path resolution so callers never hand-build filenames.
 
 import os
 
+# Document-separator sentinel emitted by 1_download.py after every document,
+# passed through 2_prepare.py verbatim (on its own line), and consumed by
+# 3_tokenize.py, which replaces it with the tokenizer's EOS id in the encoded
+# stream. It never reaches the tokenizer's training input or the model as
+# text. The angle-bracket characters are outside 2_prepare's whitelist, so
+# document text itself can never forge a separator line.
+DOC_SEPARATOR = "<|enddoc|>"
+
 
 def tokenizer_path(data_dir, tokenizer_type):
     return os.path.join(data_dir, f"tokenizer_{tokenizer_type}.json")
@@ -64,8 +72,10 @@ def load_tokenizer(data_dir, tokenizer_type):
     path = tokenizer_path(data_dir, tokenizer_type)
     if tokenizer_type == "char":
         from .char_tokenizer import CharTokenizer
+
         return CharTokenizer.load(path)
     if tokenizer_type == "bpe":
         from .bpe_tokenizer import BPETokenizer
+
         return BPETokenizer.load(path)
     raise ValueError(f"Unknown tokenizer type: {tokenizer_type!r}")
