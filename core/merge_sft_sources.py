@@ -24,10 +24,42 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR = os.path.join(_REPO_ROOT, "data")
 TEXT_FINETUNE_DIR = os.path.join(DATA_DIR, "text", "finetune")
 _WHITESPACE_RE = re.compile(r"\s+")
+_ARTIFACTS = ("<unk>", "[unk]", "[UNK]", "<|", "|>", "{{", "}}", "[[", "]]")
 
 
 def _normalize_key(s: str) -> str:
     return _WHITESPACE_RE.sub(" ", s or "").strip().lower()
+
+
+def _armenian_ratio(s: str) -> float:
+    letters = [c for c in s if c.isalpha()]
+    if not letters:
+        return 0.0
+    arm = sum(1 for c in letters if "԰" <= c <= "֏")
+    return arm / len(letters)
+
+
+def _quality_score(pair: dict) -> float:
+    """Heuristic quality score for ranked capping of a noisy source (Aya is
+    translated + rephrased, so its yield is uneven). Higher is better. Rewards
+    Armenian-script answers of a sensible length; penalizes artifacts and
+    extremes. Deterministic — used to keep the BEST N of a source instead of a
+    random N."""
+    out = (pair.get("output") or "").strip()
+    instr = (pair.get("instruction") or "").strip()
+    if not out:
+        return -1e9
+    score = 2.0 * _armenian_ratio(out) + 1.0 * _armenian_ratio(instr)
+    n = len(out)
+    if n < 20:
+        score -= 1.0
+    elif n > 2000:
+        score -= 0.5
+    else:
+        score += min(n, 400) / 400 * 0.5  # reward substantive (not one-word) answers
+    blob = out + " " + instr
+    score -= 2.0 * sum(1 for a in _ARTIFACTS if a in blob)
+    return score
 
 
 def merge_sft_sources(input_paths, output_path, weights=None, seed=1234):
@@ -108,9 +140,14 @@ def merge_sft_sources(input_paths, output_path, weights=None, seed=1234):
         n_in = len(items)
         w = weights.get(base, {})
         cap = w.get("cap")
+        rank = w.get("rank", "random")  # "quality" keeps the best N, else random N
         repeat = int(w.get("repeat", 1))
         if cap is not None and n_in > cap:
-            items = rng.sample(items, cap)
+            if rank == "quality":
+                # Keep the highest-scoring cap pairs (deterministic).
+                items = sorted(items, key=_quality_score, reverse=True)[:cap]
+            else:
+                items = rng.sample(items, cap)
         if repeat > 1:
             items = items * repeat
         rebalance_log.append((base, n_in, len(items), cap, repeat))

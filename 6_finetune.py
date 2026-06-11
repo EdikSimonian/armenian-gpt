@@ -43,6 +43,7 @@ import torch
 
 from core.model import GPT
 from core.config import get_config
+from core.training import configure_optimizer, get_lr
 
 
 # --- HF async upload helpers --------------------------------------------------
@@ -213,7 +214,7 @@ def load_data(data_dir, tokenizer_type, allow_unmasked=False):
             "  Loss masking: OFF (--allow_unmasked) — training on ALL tokens, "
             "including the questions."
         )
-        return train_data, val_data, None, None
+        return train_data, val_data, None, None, None, None
 
     train_mask = np.memmap(train_mask_path, dtype=np.uint8, mode="r")
     val_mask = np.memmap(val_mask_path, dtype=np.uint8, mode="r")
@@ -229,8 +230,34 @@ def load_data(data_dir, tokenizer_type, allow_unmasked=False):
         )
         sys.exit(1)
 
+    # Example-start offsets (uint64), if prepare_chat wrote them. With these,
+    # get_batch starts every window at an example boundary, so the model never
+    # trains on an answer-continuation whose prompt scrolled out of the window
+    # (the old random-window sampler did this for ~5-10% of supervised tokens).
+    train_idx = _load_idx(data_dir, tokenizer_type, "train", len(train_data))
+    val_idx = _load_idx(data_dir, tokenizer_type, "val", len(val_data))
+    if train_idx is not None:
+        print(
+            f"  Example-aligned packing: ON ({len(train_idx):,} train / "
+            f"{len(val_idx):,} val examples)"
+        )
+    else:
+        print("  Example-aligned packing: OFF (no idx bins; random windows)")
+
     print("  Loss masking: ON (training on response tokens only)")
-    return train_data, val_data, train_mask, val_mask
+    return train_data, val_data, train_mask, val_mask, train_idx, val_idx
+
+
+def _load_idx(data_dir, tokenizer_type, split, n_tokens):
+    """Load example-start offsets for a split, or None if absent/stale."""
+    path = os.path.join(data_dir, f"{split}_idx_{tokenizer_type}.bin")
+    if not os.path.exists(path):
+        return None
+    idx = np.memmap(path, dtype=np.uint64, mode="r")
+    if len(idx) == 0 or int(idx[-1]) >= n_tokens:
+        print(f"  WARNING: {split}_idx looks stale (ignoring, using random windows)")
+        return None
+    return idx
 
 
 def load_tokenizer(data_dir, tokenizer_type):
@@ -247,40 +274,64 @@ def load_tokenizer(data_dir, tokenizer_type):
     return _load(data_dir, tokenizer_type)
 
 
-def get_batch(data, mask, block_size, batch_size, device):
-    """Grab a random batch of sequences from the data.
+def _window_starts(data_len, block_size, batch_size, idx):
+    """Pick batch_size window start offsets. With `idx` (example starts), every
+    window begins at an example boundary so it opens with a prompt rather than
+    mid-response. Without it, fall back to uniform random offsets."""
+    if idx is not None:
+        pick = torch.randint(len(idx), (batch_size,))
+        return [int(idx[p]) for p in pick.tolist()]
+    hi = max(1, data_len - block_size)
+    return torch.randint(hi, (batch_size,)).tolist()
+
+
+def _slice_padded(data, mask, i, block_size):
+    """x, y, m for one window starting at i, right-padded to block_size when the
+    window runs past the end of the data (the tail example is shorter than the
+    window). Padding positions get mask 0, so they contribute no loss and, being
+    at the end, never corrupt the real (causal) tokens before them."""
+    x = data[i : i + block_size].astype(np.int64)
+    y = data[i + 1 : i + 1 + block_size].astype(np.int64)
+    m = mask[i + 1 : i + 1 + block_size].astype(np.bool_) if mask is not None else None
+    L = min(len(x), len(y))
+    x, y = x[:L], y[:L]
+    if m is not None:
+        m = m[:L]
+    if L < block_size:
+        pad = block_size - L
+        x = np.concatenate([x, np.zeros(pad, np.int64)])
+        y = np.concatenate([y, np.zeros(pad, np.int64)])
+        if m is not None:
+            m = np.concatenate([m, np.zeros(pad, np.bool_)])
+    return x, y, m
+
+
+def get_batch(data, mask, block_size, batch_size, device, idx=None):
+    """Grab a batch of sequences. When `idx` is given, windows start at example
+    boundaries (example-aligned packing); otherwise they are random.
 
     When `mask` is provided, target positions whose token is NOT a response
     token are set to -100 so model()'s F.cross_entropy (ignore_index=-100)
-    skips them — i.e. loss is computed on assistant-response tokens only.
-    The mask slice is aligned to y (the targets), so it indexes [i+1:i+1+B].
+    skips them — loss is computed on assistant-response tokens only.
     """
     # Retry guard: a batch whose targets are ALL -100 makes F.cross_entropy
-    # mean-reduce over zero elements -> NaN. (A single all-prompt sequence in
-    # the batch is fine; PyTorch averages over every non-ignored target across
-    # the whole batch.) We resample until at least one response token is
-    # present, and RAISE if we somehow can't — never return a NaN-producing
-    # batch silently.
+    # mean-reduce over zero elements -> NaN. We resample until at least one
+    # response token is present, and RAISE if we somehow can't.
     max_tries = 32 if mask is not None else 1
     for _ in range(max_tries):
-        ix = torch.randint(len(data) - block_size, (batch_size,))
-        x = torch.stack(
-            [torch.from_numpy(data[i : i + block_size].astype(np.int64)) for i in ix]
-        )
-        y = torch.stack(
-            [
-                torch.from_numpy(data[i + 1 : i + 1 + block_size].astype(np.int64))
-                for i in ix
-            ]
-        )
+        ix = _window_starts(len(data), block_size, batch_size, idx)
+        xs, ys, ms = [], [], []
+        for i in ix:
+            x, y, m = _slice_padded(data, mask, i, block_size)
+            xs.append(torch.from_numpy(x))
+            ys.append(torch.from_numpy(y))
+            if m is not None:
+                ms.append(torch.from_numpy(m))
+        x = torch.stack(xs)
+        y = torch.stack(ys)
         if mask is None:
             return x.to(device), y.to(device)
-        m = torch.stack(
-            [
-                torch.from_numpy(mask[i + 1 : i + 1 + block_size].astype(np.bool_))
-                for i in ix
-            ]
-        )
+        m = torch.stack(ms)
         y = y.masked_fill(~m, -100)
         if (y != -100).any():
             return x.to(device), y.to(device)  # >=1 response token — usable
@@ -301,18 +352,20 @@ def estimate_loss(
     cfg,
     use_amp=False,
     amp_dtype=None,
+    train_idx=None,
+    val_idx=None,
 ):
     """Estimate average (response-only, when masked) loss on train and val."""
     model.eval()
     results = {}
-    for split_name, data, mask in [
-        ("train", train_data, train_mask),
-        ("val", val_data, val_mask),
+    for split_name, data, mask, idx in [
+        ("train", train_data, train_mask, train_idx),
+        ("val", val_data, val_mask, val_idx),
     ]:
         losses = []
         for _ in range(cfg["eval_iters"]):
             x, y = get_batch(
-                data, mask, cfg["block_size"], cfg["batch_size"], cfg["device"]
+                data, mask, cfg["block_size"], cfg["batch_size"], cfg["device"], idx
             )
             with torch.amp.autocast(
                 device_type="cuda", dtype=amp_dtype, enabled=use_amp
@@ -322,18 +375,6 @@ def estimate_loss(
         results[split_name] = sum(losses) / len(losses)
     model.train()
     return results
-
-
-def get_lr(step, cfg):
-    """Learning rate schedule: linear warmup then cosine decay."""
-    if step < cfg["warmup_iters"]:
-        return cfg["learning_rate"] * step / max(cfg["warmup_iters"], 1)
-    decay_ratio = (step - cfg["warmup_iters"]) / (
-        cfg["max_iters"] - cfg["warmup_iters"]
-    )
-    decay_ratio = min(decay_ratio, 1.0)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return cfg["min_lr"] + coeff * (cfg["learning_rate"] - cfg["min_lr"])
 
 
 def main():
@@ -398,7 +439,7 @@ def main():
     print(f"{'=' * 50}\n")
 
     # Load chat data and tokenizer
-    train_data, val_data, train_mask, val_mask = load_data(
+    train_data, val_data, train_mask, val_mask, train_idx, val_idx = load_data(
         chat_data_dir, cfg["tokenizer"], allow_unmasked=allow_unmasked
     )
     tokenizer = load_tokenizer(chat_data_dir, cfg["tokenizer"])
@@ -524,6 +565,20 @@ def main():
                 elif len(old_shape) == 1 and old_shape[0] < new_shape[0]:
                     model_state[key][: old_shape[0]] = stage1_state[key]
 
+        # Mean-init the grafted special-token rows instead of leaving them at the
+        # random N(0, 0.02) init. Starting the new <|user|>/<|assistant|>/<|end|>
+        # embeddings at the "average existing token" gives them a sane prior and
+        # adapts faster under the short (~hundreds of steps) SFT run. wte and
+        # lm_head are tied, so one in-place write covers both.
+        wte_key = "transformer.wte.weight"
+        if wte_key in stage1_state and wte_key in model_state:
+            n_old = stage1_state[wte_key].shape[0]
+            n_new = model_state[wte_key].shape[0]
+            if n_new > n_old:
+                mean_row = model_state[wte_key][:n_old].mean(dim=0, keepdim=True)
+                model_state[wte_key][n_old:n_new] = mean_row
+                print(f"  Mean-initialized {n_new - n_old} grafted token row(s)")
+
         model.load_state_dict(model_state)
         print(f"  Loaded Stage 1 weights (vocab: {old_vocab_size} -> {new_vocab_size})")
 
@@ -536,11 +591,10 @@ def main():
         if cfg["block_size"] > stage1_cfg["block_size"]:
             cfg["block_size"] = stage1_cfg["block_size"]
 
-    # Create optimizer (fresh — don't reuse Stage 1 optimizer state)
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=cfg["learning_rate"],
-        weight_decay=cfg["weight_decay"],
+    # Create optimizer (fresh — don't reuse Stage 1 optimizer state). Same
+    # weight-decay grouping + AdamW betas as pretraining (core/training.py).
+    optimizer = configure_optimizer(
+        model, cfg["weight_decay"], cfg["learning_rate"], device=device
     )
 
     # Mixed precision + gradient accumulation (mirrors 4_train.py). On CUDA we
@@ -620,7 +674,12 @@ def main():
         loss_accum = 0.0
         for _ in range(grad_accum):
             x, y = get_batch(
-                train_data, train_mask, cfg["block_size"], cfg["batch_size"], device
+                train_data,
+                train_mask,
+                cfg["block_size"],
+                cfg["batch_size"],
+                device,
+                train_idx,
             )
             with torch.amp.autocast(
                 device_type="cuda", dtype=amp_dtype, enabled=use_amp
@@ -665,6 +724,8 @@ def main():
                 cfg,
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
+                train_idx=train_idx,
+                val_idx=val_idx,
             )
             perplexity = math.exp(losses["val"])
 

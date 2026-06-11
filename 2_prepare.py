@@ -380,15 +380,15 @@ def prepare_qa() -> None:
     ]
     output_path = os.path.join(TEXT_FINETUNE_DIR, "qa_merged.json")
 
-    # Rebalance the mix so the dataset isn't ~92% Aya rephrase/translate tasks.
-    # We CAP Aya rather than oversample the conversational QA: duplicating a
-    # ~2k-pair set replays identical gradient steps and invites memorization,
-    # whereas capping the dominant source fixes the ratio cleanly. After this,
-    # conversational QA (qwen + armbench) is ~35% of examples / ~45% of tokens.
-    # Adjust caps as the corpus grows (e.g. once #4 adds generated QA).
+    # Rebalance the mix so the dataset isn't dominated by Aya rephrase/translate
+    # tasks. We keep the BEST 15k of Aya by a quality score (Armenian-script
+    # ratio, sensible length, no artifacts) instead of a random 5k — the blunt
+    # random cap threw away most of the largest source AND kept its junk at the
+    # same rate as its good pairs. Conversational/native QA still passes through
+    # at repeat 1 (duplicating a small set replays identical gradients and
+    # invites memorization). Raise/lower the cap as the generated QA grows.
     weights = {
-        "aya_armenian.json": {"cap": 5000},
-        # qwen / armbench / claude QA pass through at repeat 1 (no duplication).
+        "aya_armenian.json": {"cap": 15000, "rank": "quality"},
     }
 
     print(f"\n{'=' * 60}")
