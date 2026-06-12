@@ -63,8 +63,7 @@ def load_model(ckpt_path, device):
     """Build the model from a checkpoint, inferring arch (incl. vocab and
     qk_norm) from the weights so chat and base checkpoints both load."""
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-    cfg = ckpt["config"]
-    state = ckpt["model"]
+    state = ckpt["model"]  # architecture is inferred from the weights, not cfg
     if any(k.startswith("_orig_mod.") for k in state):
         state = {k.removeprefix("_orig_mod."): v for k, v in state.items()}
 
