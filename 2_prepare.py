@@ -360,18 +360,24 @@ def prepare_qa() -> None:
     """Merge the SFT source JSONs into data/text/finetune/qa_merged.json."""
     from core.merge_sft_sources import merge_sft_sources
 
-    # Inputs in priority order — earlier sources win dedup ties.
-    # armenian_qa_seed.json (the categorized 10k seed generator output),
-    # armenian_qa.json, and armenian_qa_qwen*.json are only present if the
-    # user ran the optional generators; they're listed first so their
-    # native/curated pairs take priority over the larger translated sets.
+    # Inputs in priority order — earlier sources win dedup ties, so the curated,
+    # targeted, and native sources are listed BEFORE the large translated set.
+    # The targeted tier/v2_fixes files (facts, math, science, refusals) directly
+    # address the categories the chat eval flagged as weakest. All are optional
+    # (only included if present from the generators).
     candidates = [
-        "armenian_qa_seed.json",  # categorized seed generator (10k, highest quality)
+        "armenian_qa_v2_fixes.json",  # targeted fact + refusal fixes
+        "armenian_qa_tier3.json",  # reasoning + refusal/safety
+        "armenian_qa_tier2_math.json",  # step-by-step arithmetic (weakest category)
+        "armenian_qa_tier2_science.json",  # explanatory science
+        "armenian_qa_tier1_facts.json",  # factual recall
+        "armenian_qa_seed.json",  # categorized seed generator (10k, high quality)
+        "armenian_qa_demo_coverage.json",  # demo-prompt coverage
         "armenian_qa.json",  # Claude-generated (optional)
         "armenian_qa_qwen.json",  # Qwen long-form (optional)
         "armenian_qa_qwen_short.json",  # Qwen short (optional)
         "armbench_train.json",  # native exam QA
-        "aya_armenian.json",  # filtered Aya (mostly translated)
+        "aya_armenian.json",  # filtered Aya (mostly translated) — capped last
     ]
     input_paths = [
         os.path.join(TEXT_FINETUNE_DIR, f)
@@ -380,15 +386,18 @@ def prepare_qa() -> None:
     ]
     output_path = os.path.join(TEXT_FINETUNE_DIR, "qa_merged.json")
 
-    # Rebalance the mix so the dataset isn't dominated by Aya rephrase/translate
-    # tasks. We keep the BEST 15k of Aya by a quality score (Armenian-script
-    # ratio, sensible length, no artifacts) instead of a random 5k — the blunt
-    # random cap threw away most of the largest source AND kept its junk at the
-    # same rate as its good pairs. Conversational/native QA still passes through
-    # at repeat 1 (duplicating a small set replays identical gradients and
-    # invites memorization). Raise/lower the cap as the generated QA grows.
+    # Rebalance: keep the BEST 15k of Aya by quality (Armenian-script ratio,
+    # length, no artifacts) rather than a random 5k. Lightly upweight the small,
+    # high-value targeted sets so the categories the model was weakest at
+    # (clean refusals, arithmetic) aren't drowned out — these are ~90-400
+    # examples each, so a modest repeat keeps them present (~1% of the mix)
+    # without the memorization risk of heavily duplicating a tiny set.
     weights = {
         "aya_armenian.json": {"cap": 15000, "rank": "quality"},
+        "armenian_qa_v2_fixes.json": {"repeat": 3},
+        "armenian_qa_tier3.json": {"repeat": 3},  # refusals live here
+        "armenian_qa_tier2_math.json": {"repeat": 2},
+        "armenian_qa_tier2_science.json": {"repeat": 2},
     }
 
     print(f"\n{'=' * 60}")
