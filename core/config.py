@@ -333,6 +333,10 @@ def get_config():
         default=None,
         help="Floor for cosine LR decay (must be <= learning_rate)",
     )
+    parser.add_argument("--warmup_iters", type=int, default=None)
+    parser.add_argument("--weight_decay", type=float, default=None)
+    parser.add_argument("--grad_clip", type=float, default=None)
+    parser.add_argument("--eval_iters", type=int, default=None)
     parser.add_argument("--grad_accum_steps", type=int, default=None)
     parser.add_argument(
         "--lr_schedule", type=str, default=None, choices=["cosine", "wsd"]
