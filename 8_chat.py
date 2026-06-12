@@ -57,7 +57,25 @@ def main():
         "--top_k", type=int, default=40, help="Only sample from top k tokens (0=all)"
     )
     parser.add_argument(
+        "--top_p",
+        type=float,
+        default=0.0,
+        help="Nucleus sampling cumulative-prob cutoff (0=off, e.g. 0.9)",
+    )
+    parser.add_argument(
+        "--min_p",
+        type=float,
+        default=0.0,
+        help="Min-p sampling floor as a fraction of the top token's prob "
+        "(0=off, e.g. 0.05). Robust for small models; pairs well with top_k off.",
+    )
+    parser.add_argument(
         "--max_length", type=int, default=300, help="Maximum response length in tokens"
+    )
+    parser.add_argument(
+        "--single_turn",
+        action="store_true",
+        help="Disable conversation memory (each message answered in isolation)",
     )
     parser.add_argument(
         "--repetition_penalty",
@@ -120,6 +138,8 @@ def main():
             cfg["n_head"] = cfg["n_embd"] // head_dim
     elif "transformer.blocks.0.attn.bias" in state:
         cfg["block_size"] = state["transformer.blocks.0.attn.bias"].shape[-1]
+    # Detect QK-norm from the weights (present only if trained with it).
+    cfg["qk_norm"] = any("attn.q_norm.weight" in k for k in state)
 
     # Determine device
     if torch.cuda.is_available():
@@ -149,19 +169,40 @@ def main():
         n_embd=cfg["n_embd"],
         block_size=cfg["block_size"],
         dropout=0.0,
+        qk_norm=cfg.get("qk_norm", False),
     ).to(device)
     model.load_state_dict(checkpoint["model"])
     model.eval()
 
     top_k = args.top_k if args.top_k > 0 else None
+    top_p = args.top_p if args.top_p > 0 else None
+    min_p = args.min_p if args.min_p > 0 else None
+
+    def build_prompt_ids(history):
+        """Render the conversation into prompt ids, ending with an assistant cue,
+        then drop the OLDEST turns until it fits the model's context with room
+        for a full response. Always keeps the latest user turn."""
+        budget = cfg["block_size"] - args.max_length - 8  # 8 = special-token slack
+        while True:
+            parts = []
+            for role, text in history:
+                tag = "<|user|>" if role == "user" else "<|assistant|>"
+                parts.append(f"{tag}{text}<|end|>")
+            parts.append("<|assistant|>")
+            ids = tokenizer.encode("".join(parts))
+            if len(ids) <= budget or len(history) <= 1:
+                return ids
+            history.pop(0)  # evict the oldest turn and re-render
 
     # Chat loop
+    mode = "single-turn" if args.single_turn else "multi-turn"
     print(f"\n{'=' * 50}")
     print("  ArmGPT Chat")
-    print(f"  Device: {device} | Temp: {args.temperature}")
-    print("  Type 'quit' to exit")
+    print(f"  Device: {device} | Temp: {args.temperature} | {mode}")
+    print("  Type 'quit' to exit, 'reset' to clear the conversation")
     print(f"{'=' * 50}\n")
 
+    history = []  # list of (role, text)
     while True:
         try:
             user_input = input("You: ").strip()
@@ -174,13 +215,19 @@ def main():
         if user_input.lower() in ("quit", "exit", "q"):
             print("Bye!")
             break
+        if user_input.lower() in ("reset", "clear"):
+            history = []
+            print("(conversation cleared)\n")
+            continue
 
-        # Format as chat prompt
-        prompt = f"<|user|>{user_input}<|end|><|assistant|>"
-        prompt_ids = tokenizer.encode(prompt)
+        if args.single_turn:
+            history = []
+        history.append(("user", user_input))
 
+        prompt_ids = build_prompt_ids(history)
         if not prompt_ids:
             print("ArmGPT: (could not encode your message)\n")
+            history.pop()
             continue
 
         # Generate response
@@ -190,26 +237,24 @@ def main():
             max_new_tokens=args.max_length,
             temperature=args.temperature,
             top_k=top_k,
+            top_p=top_p,
+            min_p=min_p,
             stop_tokens=stop_tokens if stop_tokens else None,
             repetition_penalty=args.repetition_penalty,
         )
 
-        # Decode and clean up the response
-        full_text = tokenizer.decode(output[0].tolist())
-
-        # Extract just the assistant's response
-        if "<|assistant|>" in full_text:
-            response = full_text.split("<|assistant|>")[-1]
-        else:
-            response = full_text[len(tokenizer.decode(prompt_ids)) :]
-
-        # Remove any trailing special tokens
-        response = response.replace("<|end|>", "").replace("<|user|>", "").strip()
+        # The response is exactly the newly generated tokens after the prompt.
+        new_ids = output[0].tolist()[len(prompt_ids) :]
+        response = tokenizer.decode(new_ids)
+        response = response.replace("<|end|>", "").replace("<|user|>", "")
+        response = response.replace("<|assistant|>", "").strip()
 
         if response:
             print(f"ArmGPT: {response}\n")
+            history.append(("assistant", response))
         else:
             print("ArmGPT: ...\n")
+            history.pop()  # drop the user turn that produced nothing
 
 
 if __name__ == "__main__":
