@@ -43,6 +43,11 @@ from core.model import GPT
 _ARM_LETTERS = "ԱԲԳԴԵԶԷԸԹԺ"
 _LAT_LETTERS = "ABCDEFGHIJ"
 
+# Inline lettered option marker, e.g. "Ա) " / "Բ. " — used to parse MCQ items
+# (like ArmBench belebele) that flatten the choices into the instruction text
+# rather than carrying a structured options list.
+_OPT_RE = re.compile(r"([Ա-Ֆ])[\)\.]\s")
+
 
 def pick_device(arg):
     if arg != "auto":
@@ -97,6 +102,53 @@ def _stem(item):
 
 def _choices(item):
     return item.get("options") or item.get("choices") or []
+
+
+def _inline_mcq(item):
+    """Parse an MCQ whose choices are embedded in the instruction text as
+    lettered options (ArmBench belebele/MCQA shape: passage + 'Հարց:' + 'Ա) ...
+    Բ) ...'), with the gold answer in `output` as the full option text
+    (optionally prefixed by its letter). Returns (stem, choices, gold) or None.
+    """
+    text = item.get("instruction") or item.get("question") or item.get("prompt") or ""
+    marks = list(_OPT_RE.finditer(text))
+    if len(marks) < 2:
+        return None
+    stem = text[: marks[0].start()].strip()
+    letters = [m.group(1) for m in marks]
+    choices = []
+    for i, m in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        choices.append(text[m.end() : end].strip())
+
+    out = (item.get("output") or item.get("answer") or "").strip()
+    gold = -1
+    lead = _OPT_RE.match(out)
+    if lead and lead.group(1) in letters:
+        gold = letters.index(lead.group(1))
+        out = out[lead.end() :].strip()
+    if gold < 0:  # fall back to matching the answer text against a choice
+        norm = re.sub(r"\s+", " ", out).strip().lower()
+        for i, c in enumerate(choices):
+            if re.sub(r"\s+", " ", c).strip().lower() == norm:
+                gold = i
+                break
+    if gold < 0 or len(choices) < 2:
+        return None
+    return stem, choices, gold
+
+
+def parse_item(item):
+    """Return (stem, choices, gold_index) for an MCQ item from either a
+    structured options list or inline lettered options, or None if it isn't a
+    usable multiple-choice question."""
+    choices = _choices(item)
+    if len(choices) >= 2:
+        gold = _gold_index(item, choices)
+        if gold >= 0:
+            return _stem(item), choices, gold
+        return None
+    return _inline_mcq(item)
 
 
 def _gold_index(item, choices):
@@ -155,12 +207,11 @@ def evaluate(model, tokenizer, items, block_size, device):
     correct = correct_norm = 0
     skipped = 0
     for item in items:
-        choices = _choices(item)
-        gold = _gold_index(item, choices)
-        if len(choices) < 2 or gold < 0:
+        parsed = parse_item(item)
+        if parsed is None:
             skipped += 1
             continue
-        stem = _stem(item)
+        stem, choices, gold = parsed
         prompt_ids = tokenizer.encode(stem + "\n")
         sums, norms = [], []
         for c in choices:
