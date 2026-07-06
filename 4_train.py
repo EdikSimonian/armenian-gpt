@@ -246,16 +246,30 @@ def main():
         dropout=cfg["dropout"],
     ).to(device)
 
-    # Compile model for faster training (PyTorch 2.0+, requires CC >= 7.0)
-    if device == "cuda" and hasattr(torch, "compile"):
+    # Compile model for faster training (PyTorch 2.0+, requires CC >= 7.0).
+    # torch.compile's Inductor backend needs Triton, which has no stable
+    # Windows support — skip compile if it isn't importable so we fall back
+    # to eager mode instead of crashing on the first forward pass.
+    def _triton_available():
+        try:
+            import triton  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    if os.environ.get("NO_COMPILE") == "1":
+        print("Skipping torch.compile() (NO_COMPILE=1)")
+    elif device == "cuda" and hasattr(torch, "compile"):
         cc = torch.cuda.get_device_capability()
-        if cc[0] >= 7:
-            print("Compiling model with torch.compile()...")
-            model = torch.compile(model)
-        else:
+        if cc[0] < 7:
             print(
                 f"Skipping torch.compile() (GPU compute capability {cc[0]}.{cc[1]} < 7.0)"
             )
+        elif not _triton_available():
+            print("Skipping torch.compile() (Triton not installed; running eager mode)")
+        else:
+            print("Compiling model with torch.compile()...")
+            model = torch.compile(model)
 
     # Create optimizer. `fused=True` collapses param updates into a single
     # CUDA kernel — ~2–4% step-time win at 1 B params, free on Ampere+.
