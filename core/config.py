@@ -157,6 +157,10 @@ PRESETS = {
         max_iters=2000,
         learning_rate=3e-4,
         eval_interval=200,
+        # Pin bpe: the documented pipeline tokenizes chat data with
+        # `3_tokenize.py --qa --tokenizer bpe`, so the preset must not fall back
+        # to the module-level "char" default (which looks for train_char.bin).
+        tokenizer="bpe",
     ),
     # Stage 2 SFT for the ~930 M "giant" base model.
     #
