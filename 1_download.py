@@ -1777,35 +1777,66 @@ def _aya_to_pair(row, *, min_q_len, max_q_len, min_a_len, max_a_len, min_arm_rat
     }
 
 
-def _aya_process_source(ds, name, n_samples, rng, filters):
-    """Extract and clean one Aya source."""
-    print(f"\nFiltering {name}...")
-    sub = ds.filter(lambda x: x["dataset_name"] == name, num_proc=4)
-    total = len(sub)
-    if total == 0:
+def _aya_slim_row(row):
+    """Keep only the fields we need so buckets don't pin whole Arrow rows."""
+    return {
+        "inputs": row.get("inputs"),
+        "targets": row.get("targets"),
+        "dataset_name": row.get("dataset_name"),
+    }
+
+
+def _aya_stream_collect(ds_stream, plan, rng):
+    """Single streaming pass over the Armenian slice.
+
+    Only rows whose `dataset_name` is in `plan` are ever retained — the rest of
+    the Aya slice streams past without being materialized. Sources with an
+    integer cap are down-sampled on the fly via reservoir sampling (uniform
+    without knowing the total up front); `None`-capped sources keep everything.
+
+    Returns (buckets, seen_counts) where buckets maps source -> list of slimmed
+    raw rows and seen_counts maps source -> total raw rows encountered.
+    """
+    wanted = set(plan.keys())
+    buckets = {name: [] for name in plan}
+    seen_counts = {name: 0 for name in plan}
+
+    for row in ds_stream:
+        name = row.get("dataset_name")
+        if name not in wanted:
+            continue
+        cap = plan[name]
+        i = seen_counts[name]
+        seen_counts[name] = i + 1
+
+        if cap is None:
+            buckets[name].append(_aya_slim_row(row))
+            continue
+
+        bucket = buckets[name]
+        if len(bucket) < cap:
+            bucket.append(_aya_slim_row(row))
+        else:
+            j = rng.randint(0, i)  # inclusive, so index i is reachable
+            if j < cap:
+                bucket[j] = _aya_slim_row(row)
+
+    return buckets, seen_counts
+
+
+def _aya_clean_bucket(name, raw_rows, seen, filters):
+    """Quality-filter one source's sampled raw rows into SFT pairs."""
+    if not raw_rows:
         print(f"  {name}: not present in split, skipping")
         return []
-    print(f"  {name}: {total:,} rows available")
-
-    if n_samples is not None and n_samples < total:
-        idxs = rng.sample(range(total), n_samples)
-        candidates = (sub[i] for i in idxs)
-        pool_size = n_samples
-    else:
-        candidates = (sub[i] for i in range(total))
-        pool_size = total
-
     kept = []
-    dropped = 0
-    for row in candidates:
+    for row in raw_rows:
         pair = _aya_to_pair(row, **filters)
-        if pair is None:
-            dropped += 1
-            continue
-        kept.append(pair)
-    yield_rate = 100.0 * len(kept) / max(pool_size, 1)
-    print(f"  {name}: kept {len(kept):,} / {pool_size:,} "
-          f"({yield_rate:.1f}% yield, {dropped:,} dropped)")
+        if pair is not None:
+            kept.append(pair)
+    yield_rate = 100.0 * len(kept) / max(len(raw_rows), 1)
+    print(f"  {name}: kept {len(kept):,} / {len(raw_rows):,} sampled "
+          f"(seen {seen:,}, {yield_rate:.1f}% yield)")
     return kept
 
 
@@ -1845,14 +1876,19 @@ def fetch_aya_qa(
     print(f"  Sources in plan:      {len(plan)}")
     print(f"  Output:               {output_path}")
 
-    print(f"\nLoading {_AYA_REPO} (armenian/train)...")
-    ds = load_dataset(_AYA_REPO, "armenian", split="train")
-    print(f"  Total Armenian rows: {len(ds):,}")
+    print(f"\nStreaming {_AYA_REPO} (armenian/train)...")
+    print(f"  Keeping only {len(plan)} Q&A sources; the rest of the slice "
+          f"streams past without being cached to disk.")
+    # streaming=True mirrors the corpus path: no full-slice materialization.
+    ds = load_dataset(_AYA_REPO, "armenian", split="train", streaming=True)
+
+    # One pass: bucket + sample only the wanted sources.
+    buckets, seen_counts = _aya_stream_collect(ds, plan, rng)
 
     all_pairs = []
     per_source_counts = {}
-    for name, n_samples in plan.items():
-        kept = _aya_process_source(ds, name, n_samples, rng, filters)
+    for name in plan:
+        kept = _aya_clean_bucket(name, buckets[name], seen_counts[name], filters)
         all_pairs.extend(kept)
         per_source_counts[name] = len(kept)
 
@@ -1924,6 +1960,61 @@ def download_qa(args):
     print(f"{'='*60}")
     print(f"  Optional: also run core/generate_armenian_qa.py to add")
     print(f"            Claude-generated pairs under data/text/finetune/")
+    print(f"\n  Next step: python 2_prepare.py --qa")
+
+
+def download_qa_from_hf(repo_id, finetune_dir, token=None):
+    """Fetch ONLY the pre-built Q&A finetuning JSONs from the HF dataset repo.
+
+    This is the default for ``--qa``: pull the ready-made SFT files under
+    ``finetune/`` in the dataset repo and nothing else — no corpus, no raw Aya
+    slice scan. The heavy source build (ArmBench + Aya) that originally produced
+    these files lives behind ``--qa --build``.
+    """
+    from huggingface_hub import HfApi, hf_hub_download, get_token
+
+    token = token or os.environ.get("HF_TOKEN") or get_token()
+    if not token:
+        print("Error: no HF_TOKEN found - run 'hf auth login' first.")
+        sys.exit(1)
+
+    os.makedirs(finetune_dir, exist_ok=True)
+
+    print(f"{'='*60}")
+    print(f"  ArmGPT Q&A fetch (finetuning data only)")
+    print(f"{'='*60}")
+    print(f"  Repo:    {repo_id}")
+    print(f"  Output:  {finetune_dir}")
+    print(f"{'='*60}\n")
+
+    api = HfApi(token=token)
+    all_files = api.list_repo_files(repo_id, repo_type="dataset", token=token)
+    qa_files = [
+        f for f in all_files
+        if f.startswith(f"{HF_FINETUNE_DIR}/") and f.endswith(".json")
+    ]
+    if not qa_files:
+        print(f"No Q&A files found under {HF_FINETUNE_DIR}/ in {repo_id}.")
+        print("Build them from sources first, then upload:")
+        print("  python 1_download.py --qa --build")
+        print("  python 1_download.py --upload")
+        sys.exit(1)
+
+    for hf_path in qa_files:
+        local_path = hf_hub_download(
+            repo_id=repo_id,
+            filename=hf_path,
+            repo_type="dataset",
+            token=token,
+            cache_dir=HF_CACHE_DIR,
+        )
+        target = os.path.join(finetune_dir, os.path.basename(hf_path))
+        shutil.copy2(local_path, target)
+        print(f"  {os.path.basename(hf_path)}")
+
+    print(f"\n{'='*60}")
+    print(f"  Fetched {len(qa_files)} Q&A file(s) -> {finetune_dir}")
+    print(f"{'='*60}")
     print(f"\n  Next step: python 2_prepare.py --qa")
 
 
@@ -2478,11 +2569,17 @@ def main():
         description="Download Armenian text data (corpus by default, or --qa for SFT sources)"
     )
     parser.add_argument("--qa", action="store_true",
-                        help="Download SFT Q&A sources (ArmBench + Aya) instead of raw corpus")
+                        help="Fetch ONLY the pre-built SFT Q&A finetuning files from the HF "
+                             f"dataset repo (finetune/*.json in {DEFAULT_HF_DATASET_REPO}). "
+                             "No corpus, no raw source scan. Add --build to regenerate them "
+                             "from raw sources (ArmBench + Aya) instead.")
+    parser.add_argument("--build", action="store_true",
+                        help="With --qa: rebuild the Q&A files from raw sources "
+                             "(ArmBench + Aya) instead of fetching pre-built files from HF")
     parser.add_argument("--skip", nargs="*", default=[],
                         help="Sources to skip. Corpus: wiki wikisource wiktionary wikiquote "
                              "cc100 hplt3 arlis ccnews opensubtitles culturax mc4 glot500 "
-                             "finetranslations. QA: armbench aya")
+                             "finetranslations. QA build (--qa --build): armbench aya")
     parser.add_argument("--workers", type=int, default=5,
                         help="Max parallel HF downloads (corpus mode only; default: 5)")
 
@@ -2504,7 +2601,7 @@ def main():
 
     args = parser.parse_args()
 
-    # --upload / --download short-circuit before any other mode
+    # --upload short-circuits before any other mode
     if args.upload:
         upload_dataset_to_hf(
             repo_id=args.hf_repo,
@@ -2513,6 +2610,18 @@ def main():
             tokenized=args.tokenized,
             data_dir=DATA_DIR,
         )
+        return
+
+    # Q&A mode: fetch only the finetuning data. Default pulls the pre-built
+    # JSONs from HF; --build regenerates them from raw sources (ArmBench + Aya).
+    if args.qa:
+        if args.build:
+            download_qa(args)
+        else:
+            download_qa_from_hf(
+                repo_id=args.hf_repo,
+                finetune_dir=TEXT_FINETUNE_DIR,
+            )
         return
 
     if args.download or args.tokenized_only:
@@ -2526,10 +2635,7 @@ def main():
         )
         return
 
-    if args.qa:
-        download_qa(args)
-    else:
-        download_corpus(args)
+    download_corpus(args)
 
 
 if __name__ == "__main__":
